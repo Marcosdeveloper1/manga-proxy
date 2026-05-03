@@ -264,7 +264,7 @@ async function mpSearch(query) {
 //  Docs: https://api.comick.io
 // ══════════════════════════════════════════════════════════════════════════════
 
-const COMICK_BASE = 'https://comick-source-api.notaspider.dev';
+const COMICK_BASE = 'https://comick-source-api.notaspider.dev/api';
 const COMICK_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Accept': 'application/json',
@@ -273,56 +273,63 @@ const COMICK_HEADERS = {
 
 async function comickSearch(query) {
   try {
-    const response = await fetchJSON(
-      `${COMICK_BASE}/search?q=${encodeURIComponent(query)}&limit=20`
+    console.log(`[COMICK] Buscando: "${query}"`);
+    
+    const response = await fetchPOST(
+      `${COMICK_BASE}/search`,
+      { query: query, source: "all" },
+      { 'Content-Type': 'application/json' }
     );
-    return (response.data || []).map(item => ({
+    
+    const data = JSON.parse(response.buffer.toString('utf8'));
+    console.log('[COMICK] Response:', data);
+    
+    return (data.results || []).map(item => ({
       id: item.id,
       title: item.title,
-      coverUrl: item.poster ? `https://meo.comick.pictures/${item.poster}` : null,
-      source: 'comick'
+      coverUrl: item.coverImage,
+      source: 'comick',
+      url: item.url  // pra usar depois
     })).filter(r => r.id && r.title);
   } catch (e) {
-    console.warn('[COMICK] search erro:', e.message);
+    console.error('[COMICK] erro:', e.message);
     return [];
   }
 }
 
-async function comickGetManga(hid) {
+async function comickGetManga(mangaId) {
   try {
-    const data = await fetchJSON(`${COMICK_BASE}/comic/${hid}?lang=pt`);
-    const comic = data.comic || data;
-    const cover = comic.md_covers?.[0];
-    const coverUrl = cover ? `https://meo.comick.pictures/${cover.b2key}` : null;
-    const title = comic.title || comic.slug || '';
-    const description = comic.desc || comic.summary || '';
-
-    // Busca capítulos — tenta PT-BR primeiro, depois EN
-    let chapters = [];
-    for (const lang of ['pt', 'en']) {
-      try {
-        const chData = await fetchJSON(
-          `${COMICK_BASE}/comic/${hid}/chapters?lang=${lang}&page=1&limit=100&chap-order=1`,
-          COMICK_HEADERS
-        );
-        const chList = chData.chapters || chData || [];
-        if (Array.isArray(chList) && chList.length > 0) {
-          chapters = chList.map(c => ({
-            id: c.hid,
-            title: c.title || `Capítulo ${c.chap}`,
-            chapterNumber: c.chap || '0',
-            lang,
-            source: 'comick',
-          }));
-          break;
-        }
-      } catch (_) {}
-    }
-
-    return { title, coverUrl, description, chapters, source: 'comick' };
+    // Primeiro pega detalhes do manga
+    const searchResp = await fetchPOST(
+      `${COMICK_BASE}/search`,
+      { query: mangaId, source: "all" }
+    );
+    const searchData = JSON.parse(searchResp.buffer.toString('utf8'));
+    const manga = searchData.results?.[0];
+    if (!manga) return { title: '', chapters: [], source: 'comick' };
+    
+    // Pega capítulos
+    const chaptersResp = await fetchPOST(
+      `${COMICK_BASE}/chapters`,
+      { url: manga.url }
+    );
+    const chaptersData = JSON.parse(chaptersResp.buffer.toString('utf8'));
+    
+    return {
+      title: manga.title,
+      coverUrl: manga.coverImage,
+      description: `Latest: ${manga.latestChapter} | Updated: ${manga.lastUpdated}`,
+      chapters: (chaptersData.chapters || []).map(c => ({
+        id: c.id,
+        title: c.title || `Cap ${c.number}`,
+        chapterNumber: c.number,
+        source: 'comick'
+      })),
+      source: 'comick'
+    };
   } catch (e) {
-    console.error('[COMICK] getManga erro:', e.message);
-    return { title: '', description: '', chapters: [], source: 'comick' };
+    console.error('[COMICK] getManga erro:', e);
+    return { title: '', chapters: [], source: 'comick' };
   }
 }
 
