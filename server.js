@@ -78,7 +78,10 @@ function mpHeaders() {
     'Origin': 'https://mangaplus.shueisha.co.jp',
     'Referer': 'https://mangaplus.shueisha.co.jp/',
     'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
-    'SESSION-TOKEN': randomUUID(),  // ← a correção principal
+    'SESSION-TOKEN': randomUUID(),
+    'OS-VERSION': 'Android/14',
+    'APP-VERSION': '100',
+    'ANDROID-ID': randomUUID().replace(/-/g, '').slice(0, 16),
   };
 }
 
