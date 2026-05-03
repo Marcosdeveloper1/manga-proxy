@@ -1095,11 +1095,7 @@ function deduplicateChapters(rawChapters) {
   for (const ch of rawChapters) {
     const num = ch.attributes.chapter ?? ch.attributes.title ?? ch.id;
     const existing = chapMap.get(num);
-    
-    if (!existing) {
-      chapMap.set(num, ch);
-      continue;
-    }
+    if (!existing) { chapMap.set(num, ch); continue; }
 
     const newIsBr = isBrGroup(ch);
     const oldIsBr = isBrGroup(existing);
@@ -1107,98 +1103,89 @@ function deduplicateChapters(rawChapters) {
     const oldPages = existing.attributes.pages || 0;
 
     // Prefere grupo BR; se empate, prefere mais páginas
-    if (newIsBr && !oldIsBr) {
-      chapMap.set(num, ch);
-    } else if (!newIsBr && oldIsBr) {
-      // mantém existing
-    } else if (newPages >= oldPages) {
-      // Se ambos são BR ou ambos não são, pega o que tem mais páginas (ou o mais recente)
-      chapMap.set(num, ch);
-    }
+    if (newIsBr && !oldIsBr) { chapMap.set(num, ch); }
+    else if (!newIsBr && oldIsBr) { /* mantém existing */ }
+    else if (newPages > oldPages) { chapMap.set(num, ch); }
   }
-
-  // Ordena por número de capítulo decrescente
   return [...chapMap.values()].sort((a, b) => {
     const na = parseFloat(a.attributes.chapter) || 0;
     const nb = parseFloat(b.attributes.chapter) || 0;
-    if (nb !== na) return nb - na;
-    return 0;
+    return nb - na; // mais recente primeiro
   });
 }
 
 async function mdxGetManga(mangaId) {
-  try {
-    // 1. Metadados do Mangá
-    const m = (await fetchJSON(
-      `https://api.mangadex.org/manga/${mangaId}?includes[]=cover_art&includes[]=author`,
-      { 'User-Agent': 'MangaHook/1.0 (educational)' }
-    )).data;
+  // Metadados
+  const m = (await fetchJSON(
+    `https://api.mangadex.org/manga/${mangaId}?includes[]=cover_art&includes[]=author`,
+    { 'User-Agent': 'MangaHook/1.0 (educational)' }
+  )).data;
 
-    if (!m) throw new Error('Mangá não encontrado no MangaDex');
+  const title = m.attributes.title['pt-br'] || m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
+  const cover = m.relationships.find(r => r.type === 'cover_art');
+  const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
+  const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
+  const author = m.relationships.find(r => r.type === 'author');
 
-    const title = m.attributes.title['pt-br'] || m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
-    const cover = m.relationships.find(r => r.type === 'cover_art');
-    const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
-    const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
-    const author = m.relationships.find(r => r.type === 'author');
+  // Verifica idiomas disponíveis primeiro (evita requests inúteis)
+  const availLangs = m.attributes.availableTranslatedLanguages || [];
+  console.log(`[MDX] "${title}" | langs disponíveis: [${availLangs.join(', ')}]`);
 
-    // 2. Busca capítulos por idioma prioritário
-    const availLangs = m.attributes.availableTranslatedLanguages || [];
-    console.log(`[MDX] "${title}" | langs disponíveis: [${availLangs.join(', ')}]`);
+  // Estratégia: PT-BR → PT → EN — NUNCA mistura idiomas
+  let rawChapters = [];
+  let usedLang = null;
 
-    let rawChapters = [];
-    let usedLang = null;
+  const langsToTry = ['pt-br', 'pt', 'en'].filter(l =>
+    availLangs.length === 0 || availLangs.includes(l)
+  );
+  // Se nenhum dos preferidos está disponível, tenta EN de qualquer jeito como último recurso
+  if (!langsToTry.includes('en')) langsToTry.push('en');
 
-    // Ordem de preferência: pt-br -> pt -> en
-    const priorityLangs = ['pt-br', 'pt', 'en'];
-    
-    for (const lang of priorityLangs) {
-      try {
-        const data = await mdxFetchChaptersForLang(mangaId, lang);
-        if (data.length > 0) {
-          rawChapters = data;
-          usedLang = lang;
-          console.log(`[MDX] Encontrados ${data.length} capítulos em "${lang}"`);
-          break;
-        }
-      } catch (e) {
-        console.warn(`[MDX] Erro ao buscar lang="${lang}":`, e.message);
+  for (const lang of langsToTry) {
+    try {
+      const data = await mdxFetchChaptersForLang(mangaId, lang);
+      if (data.length > 0) {
+        rawChapters = data;
+        usedLang = lang;
+        console.log(`[MDX] ${data.length} caps raw em "${lang}"`);
+        break;
       }
+    } catch (e) {
+      console.warn(`[MDX] erro lang="${lang}":`, e.message);
     }
+  }
 
-    // 3. Deduplicação e Formatação
-    const sorted = deduplicateChapters(rawChapters);
-    const chapters = sorted.map(ch => {
-      const groups = (ch.relationships || [])
-        .filter(r => r.type === 'scanlation_group')
-        .map(r => r.attributes?.name || r.id)
-        .filter(Boolean);
-      return {
-        id: ch.id,
-        title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
-        chapterNumber: ch.attributes.chapter || '0',
-        volume: ch.attributes.volume || null,
-        lang: usedLang,
-        groups,
-        source: 'mangadex'
-      };
-    });
+  const sorted = deduplicateChapters(rawChapters);
 
+  const chapters = sorted.map(ch => {
+    const groups = (ch.relationships || [])
+      .filter(r => r.type === 'scanlation_group')
+      .map(r => r.attributes?.name || r.id)
+      .filter(Boolean);
     return {
-      title,
-      coverUrl,
-      description: desc,
-      author: author?.attributes?.name || '',
-      status: m.attributes.status || '',
-      year: m.attributes.year || null,
-      availableLangs: availLangs,
-      chapters,
+      id: ch.id,
+      title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
+      chapterNumber: ch.attributes.chapter || '0',
+      volume: ch.attributes.volume || null,
+      lang: usedLang,
+      groups,
       source: 'mangadex'
     };
-  } catch (e) {
-    console.error('[MDX] mdxGetManga erro:', e.message);
-    throw e;
-  }
+  });
+
+  console.log(`[MDX] "${title}" | ${chapters.length} caps únicos em "${usedLang || 'nenhum'}"`);
+
+  return {
+    title,
+    coverUrl,
+    description: desc,
+    author: author?.attributes?.name || '',
+    status: m.attributes.status || '',
+    year: m.attributes.year || null,
+    availableLangs: availLangs,
+    chapters,
+    source: 'mangadex'
+  };
 }
 
 async function mdxGetPages(chapterId) {
@@ -1379,11 +1366,13 @@ function xorDecrypt(buf, hexKey) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', version: '14.1',
-  sources: ['mangaplus', 'comick', 'mangadex', 'dynasty', 'anilist'],
+  status: 'ok', version: '15.0',
+  sources: ['mangaplus', 'comick', 'mangadex', 'dynasty', 'lermangas', 'tatakae', 'sakura', 'taiyo', 'kakusei', 'anilist'],
+  flaresolverr: FLARE_URL,
+  flareSessions: Object.fromEntries(Object.entries(flareSessions).map(([d,s]) => [d, s.sessionId ? 'ativa' : 'sem-sessao'])),
   comickCacheSize: Object.keys(comickById).length,
   searchCacheSize: Object.values(searchCache).reduce((n, s) => n + Object.keys(s).length, 0),
-  endpoints: ['/', '/search', '/search-br', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta', '/debug-comick', '/debug-chapter']
+  endpoints: ['/', '/search', '/search-br', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta', '/debug-comick', '/debug-chapter', '/flare-test']
 }));
 
 // ─── GET /search?q=...&source=...&lang=... ───────────────────────────────────
@@ -1397,8 +1386,13 @@ app.get('/search', async (req, res) => {
   if (source === 'anilist') return res.json({ results: await anilistSearch(q), source: 'anilist' });
   if (source === 'mangadex') return res.json({ results: await mdxSearch(q, lang || null), source: 'mangadex' });
   if (source === 'dynasty') return res.json({ results: await dynastySearch(q), source: 'dynasty' });
+  // Sources BR via FlareSolverr
+  if (source && BR_SOURCES[source]) {
+    const r = await BR_SOURCES[source].search(q);
+    return res.json({ results: r, source });
+  }
 
-  // Auto: MangaPlus → Comick → MangaDex → Dynasty
+  // Auto: MangaPlus → Comick → MangaDex → Dynasty → sites BR
   try {
     const mp = await mpSearch(q);
     if (mp.length > 0) { console.log(`[SEARCH] MangaPlus: ${mp.length}`); return res.json({ results: mp, source: 'mangaplus' }); }
@@ -1459,6 +1453,16 @@ app.get('/manga', async (req, res) => {
     return res.json(d);
   }
 
+  // Sites BR via FlareSolverr (id formato "source:slug")
+  const brSrc = getBrSource(id, source);
+  if (brSrc) {
+    try {
+      const d = await BR_SOURCES[brSrc].getManga(id);
+      console.log(`[MANGA] ${brSrc}: "${d.title}" | ${d.chapters.length} caps`);
+      return res.json(d);
+    } catch (e) { console.error(`[MANGA] ${brSrc} erro:`, e.message); }
+  }
+
   if (source === 'mangaplus' || /^\d{5,7}$/.test(id)) {
     try {
       const d = await mpGetTitle(id);
@@ -1505,6 +1509,17 @@ app.get('/chapter', async (req, res) => {
     } catch (e) { console.error('[CHAPTER] Dynasty erro:', e.message); }
   }
 
+  // Sites BR via FlareSolverr — id formato "source:BASE64"
+  const brSrcCh = getBrSource(id, source);
+  if (brSrcCh) {
+    try {
+      const b64 = id.replace(/^[a-z]+:/, '');
+      const pages = await BR_SOURCES[brSrcCh].getPages(b64);
+      console.log(`[CHAPTER] ${brSrcCh}: ${pages.length} páginas`);
+      return res.json({ pages, source: brSrcCh });
+    } catch (e) { console.error(`[CHAPTER] ${brSrcCh} erro:`, e.message); }
+  }
+
   if (source === 'mangaplus' || /^\d{6,10}$/.test(id)) {
     try {
       const pageData = await mpGetPages(id);
@@ -1544,11 +1559,18 @@ app.get('/image-proxy', async (req, res) => {
   try {
     const decodedUrl = decodeURIComponent(url);
     // Referer dinâmico dependendo do domínio
+    const domain = getDomain(decodedUrl);
     const referer = decodedUrl.includes('dynasty-scans') ? 'https://dynasty-scans.com/'
       : decodedUrl.includes('mangaplus') ? 'https://mangaplus.shueisha.co.jp/'
       : decodedUrl.includes('mangadex') ? 'https://mangadex.org/'
-      : 'https://mangaplus.shueisha.co.jp/';
-    const { buffer, status } = await fetchRaw(decodedUrl, { 'Referer': referer });
+      : `https://${domain}/`;
+    // Se temos cookies do FlareSolverr para esse domínio, usa eles
+    const flareSession = flareSessions[domain];
+    const extraHeaders = flareSession ? {
+      'Cookie': flareSession.cookies.map(c => `${c.name}=${c.value}`).join('; '),
+      'User-Agent': flareSession.userAgent,
+    } : {};
+    const { buffer, status } = await fetchRaw(decodedUrl, { 'Referer': referer, ...extraHeaders });
     if (status !== 200) return res.status(status).send('Erro ' + status);
     const result = key ? xorDecrypt(buffer, decodeURIComponent(key)) : buffer;
     res.setHeader('Content-Type', 'image/jpeg');
@@ -1654,7 +1676,38 @@ app.get('/debug-chapter', async (req, res) => {
   } catch (e) { res.status(500).json({ erro: e.message }); }
 });
 
+
+// ─── GET /flare-test?url=... ─────────────────────────────────────────────────
+// Testa se o FlareSolverr consegue acessar uma URL
+app.get('/flare-test', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const { url } = req.query;
+  if (!url) {
+    return res.json({
+      flareUrl: FLARE_URL,
+      activeSessions: Object.keys(flareSessions),
+      tip: 'Adicione ?url=https://lermangas.me para testar'
+    });
+  }
+  try {
+    const start = Date.now();
+    const result = await flareGet(decodeURIComponent(url), false);
+    return res.json({
+      ok: true,
+      status: result.status,
+      htmlLength: result.html.length,
+      ms: Date.now() - start,
+      userAgent: result.userAgent,
+      cookies: result.cookies.length,
+      htmlSample: result.html.slice(0, 500),
+    });
+  } catch (e) {
+    return res.json({ ok: false, error: e.message, flareUrl: FLARE_URL });
+  }
+});
+
 // ─── GET /cache-clear ────────────────────────────────────────────────────────
+
 app.get('/cache-clear', (req, res) => {
   const { source } = req.query;
   if (source && searchCache[source]) {
@@ -1668,4 +1721,3 @@ app.get('/cache-clear', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy v14.0 na porta ${PORT}`));
- 
