@@ -278,21 +278,34 @@ async function comickSearch(query) {
     const response = await fetchPOST(
       `${COMICK_BASE}/search`,
       { query: query, source: "all" },
-      { 'Content-Type': 'application/json' }
+      { 
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
     );
     
-    const data = JSON.parse(response.buffer.toString('utf8'));
-    console.log('[COMICK] Response:', data);
+    const text = response.buffer.toString('utf8');
+    console.log(`[COMICK] Status: ${response.status}, Primeiros 200 chars:`, text.slice(0, 200));
+    
+    // Se não é JSON válido, falha
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      console.error('[COMICK] JSON inválido:', parseErr.message);
+      console.error('[COMICK] Conteúdo:', text.slice(0, 500));
+      return [];
+    }
     
     return (data.results || []).map(item => ({
       id: item.id,
       title: item.title,
       coverUrl: item.coverImage,
-      source: 'comick',
-      url: item.url  // pra usar depois
+      source: 'comick'
     })).filter(r => r.id && r.title);
+    
   } catch (e) {
-    console.error('[COMICK] erro:', e.message);
+    console.error('[COMICK] erro total:', e.message);
     return [];
   }
 }
