@@ -6,123 +6,262 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || null;
 
-// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+// ─── Helpers HTTP ──────────────────────────────────────────────────────────────
 
-function fetchRaw(url, referer) {
+function fetchRaw(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
+    const defaultHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      'Accept': '*/*',
     };
-    if (referer) headers['Referer'] = referer;
-    lib.get(url, { headers }, (res) => {
+    lib.get(url, { headers: { ...defaultHeaders, ...headers } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return fetchRaw(res.headers.location, referer).then(resolve).catch(reject);
+        return fetchRaw(res.headers.location, headers).then(resolve).catch(reject);
       }
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => resolve({ html: data, status: res.statusCode }));
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => resolve({ buffer: Buffer.concat(chunks), status: res.statusCode }));
     }).on('error', reject);
   });
 }
 
-function postJSON(url, body) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    const u = new URL(url);
-    const opts = {
-      hostname: u.hostname, port: u.port || (url.startsWith('https') ? 443 : 80),
-      path: u.pathname, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-    };
-    const req = lib.request(opts, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
-    });
-    req.on('error', reject);
-    req.write(body);
-    req.end();
-  });
+function fetchText(url, headers = {}) {
+  return fetchRaw(url, headers).then(r => ({ html: r.buffer.toString('utf8'), status: r.status }));
 }
 
-async function fetchWithFlare(url, referer) {
-  if (FLARESOLVERR_URL) {
-    try {
-      const payload = JSON.stringify({ cmd: 'request.get', url, maxTimeout: 60000 });
-      const result = await postJSON(FLARESOLVERR_URL + '/v1', payload);
-      if (result?.solution?.response) {
-        return { html: result.solution.response, status: result.solution.status };
-      }
-    } catch (e) {
-      console.warn('[Flare] erro:', e.message);
-    }
-  }
-  return fetchRaw(url, referer);
-}
-
-function fetchJSON(url) {
-  return new Promise((resolve, reject) => {
-    const lib = url.startsWith('https') ? https : http;
-    lib.get(url, { headers: { 'User-Agent': 'MangaApp/1.0', 'Accept': 'application/json' } }, (res) => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
-    }).on('error', reject);
-  });
-}
-
-function isCloudflareBlock(html) {
-  return html.includes('cf-browser-verification') || 
-         html.includes('Just a moment') || 
-         html.includes('Checking your browser') ||
-         html.includes('cf_chl_');
+function fetchJSON(url, headers = {}) {
+  return fetchText(url, { Accept: 'application/json', ...headers })
+    .then(r => JSON.parse(r.html));
 }
 
 function isUuid(str) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 }
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
+// ─── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Content-Type', 'application/json');
   next();
 });
 
-// ─── Health ───────────────────────────────────────────────────────────────────
+// ─── Health ────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', flaresolverr: !!FLARESOLVERR_URL });
+  res.json({ status: 'ok', flaresolverr: !!FLARESOLVERR_URL, version: '3.0-mangaplus' });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /search?q=...
-// ─────────────────────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+//  MANGAPLUS — API oficial da Shueisha
+//  One Piece titleId: 700005 | Naruto: 700007 | Boruto: 700011
+//  A API responde em Protobuf. Usamos um parser mínimo manual.
+// ══════════════════════════════════════════════════════════════════════════════
+
+const MP_API = 'https://jumpg-webapi.tokyo-cdn.com/api';
+const MP_HEADERS = {
+  'User-Agent': 'Mozilla/5.0',
+  'Origin': 'https://mangaplus.shueisha.co.jp',
+  'Referer': 'https://mangaplus.shueisha.co.jp/',
+};
+
+function genDeviceId() {
+  const hex = () => Math.floor(Math.random() * 16).toString(16);
+  return Array.from({ length: 32 }, hex).join('');
+}
+
+// Parser Protobuf mínimo — retorna array de [fieldNum, wireType, value]
+function parseProtobuf(buf) {
+  const fields = [];
+  let pos = 0;
+
+  function readVarint() {
+    let val = 0, shift = 0, byte;
+    do {
+      if (pos >= buf.length) break;
+      byte = buf[pos++];
+      val |= (byte & 0x7F) << shift;
+      shift += 7;
+    } while (byte & 0x80);
+    return val;
+  }
+
+  while (pos < buf.length) {
+    try {
+      const tag = readVarint();
+      if (tag === 0) break;
+      const fieldNum = tag >> 3;
+      const wireType = tag & 0x7;
+      if (wireType === 0) {
+        fields.push([fieldNum, 0, readVarint()]);
+      } else if (wireType === 2) {
+        const len = readVarint();
+        const bytes = buf.slice(pos, pos + len);
+        pos += len;
+        fields.push([fieldNum, 2, bytes]);
+      } else if (wireType === 5) {
+        fields.push([fieldNum, 5, buf.readUInt32LE ? buf.readUInt32LE(pos) : 0]);
+        pos += 4;
+      } else if (wireType === 1) {
+        pos += 8;
+      } else {
+        break;
+      }
+    } catch (_) { break; }
+  }
+  return fields;
+}
+
+function pbStr(buf) { return buf.toString('utf8'); }
+
+// ─── Busca títulos no MangaPlus ────────────────────────────────────────────────
+async function mpSearchTitle(query) {
+  // Endpoint de todos os títulos (funciona sem auth)
+  const url = `${MP_API}/title_list/allV3`;
+  const { buffer } = await fetchRaw(url, MP_HEADERS);
+  const topFields = parseProtobuf(buffer);
+  const results = [];
+  const q = query.toLowerCase();
+
+  function tryExtractTitle(buf) {
+    const fields = parseProtobuf(buf);
+    let titleId = null, name = null, cover = null;
+    for (const [f, w, v] of fields) {
+      if (f === 1 && w === 0) titleId = v;
+      if (f === 2 && w === 2) { try { name = pbStr(v); } catch(_) {} }
+      if (f === 23 && w === 2) { try { cover = pbStr(v); } catch(_) {} }
+      if (f === 4 && w === 2 && !cover) { try { cover = pbStr(v); } catch(_) {} }
+    }
+    if (titleId && name && name.toLowerCase().includes(q)) {
+      results.push({ id: String(titleId), title: name, coverUrl: cover, source: 'mangaplus' });
+    }
+  }
+
+  // O Protobuf do MangaPlus tem vários níveis de aninhamento
+  for (const [fn, wt, val] of topFields) {
+    if (wt !== 2) continue;
+    tryExtractTitle(val);
+    const inner = parseProtobuf(val);
+    for (const [f2, w2, v2] of inner) {
+      if (w2 !== 2) continue;
+      tryExtractTitle(v2);
+      const inner2 = parseProtobuf(v2);
+      for (const [f3, w3, v3] of inner2) {
+        if (w3 === 2) tryExtractTitle(v3);
+      }
+    }
+  }
+  return results.slice(0, 20);
+}
+
+// ─── Detalhes e capítulos de um título ────────────────────────────────────────
+async function mpGetTitle(titleId) {
+  const url = `${MP_API}/title_detail?title_id=${titleId}`;
+  const { buffer } = await fetchRaw(url, MP_HEADERS);
+  const fields = parseProtobuf(buffer);
+
+  let title = '', coverUrl = '', description = '';
+  const chapters = [];
+
+  function tryExtractChapter(buf) {
+    const inner = parseProtobuf(buf);
+    let chapterId = null, name = '', num = '';
+    for (const [f, w, v] of inner) {
+      if (f === 1 && w === 0) chapterId = v;
+      if (f === 2 && w === 2) { try { name = pbStr(v); } catch(_) {} }
+      if (f === 3 && w === 2) { try { num = pbStr(v); } catch(_) {} }
+      if (f === 6 && w === 2 && !num) { try { num = pbStr(v); } catch(_) {} }
+    }
+    if (chapterId && chapterId > 0) {
+      chapters.push({
+        id: String(chapterId),
+        title: name || `Capítulo ${num}`,
+        chapterNumber: num || '0',
+        source: 'mangaplus',
+      });
+    }
+  }
+
+  for (const [fn, wt, val] of fields) {
+    if (wt !== 2) continue;
+    const inner = parseProtobuf(val);
+    for (const [f2, w2, v2] of inner) {
+      if (f2 === 1 && w2 === 2) { try { title = pbStr(v2); } catch(_) {} }
+      if (f2 === 3 && w2 === 2) { try { coverUrl = pbStr(v2); } catch(_) {} }
+      if (f2 === 6 && w2 === 2) { try { description = pbStr(v2); } catch(_) {} }
+      if ((f2 === 5 || f2 === 6) && w2 === 2) tryExtractChapter(v2);
+    }
+    tryExtractChapter(val);
+  }
+
+  return { title, coverUrl, description, chapters };
+}
+
+// ─── Páginas de um capítulo (com descriptografia XOR) ─────────────────────────
+async function mpGetChapterPages(chapterId) {
+  const deviceId = genDeviceId();
+  const url = `${MP_API}/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high&device_id=${deviceId}`;
+  const { buffer } = await fetchRaw(url, MP_HEADERS);
+  const fields = parseProtobuf(buffer);
+
+  const pages = [];
+
+  function tryExtractPage(buf) {
+    const inner = parseProtobuf(buf);
+    let imageUrl = null, encKey = null;
+    for (const [f, w, v] of inner) {
+      if (f === 1 && w === 2) { try { const s = pbStr(v); if (s.startsWith('http')) imageUrl = s; } catch(_) {} }
+      if (f === 4 && w === 2) { try { encKey = pbStr(v); } catch(_) {} }
+    }
+    if (imageUrl && encKey) pages.push({ imageUrl, encryptionKey: encKey });
+  }
+
+  for (const [fn, wt, val] of fields) {
+    if (wt !== 2) continue;
+    tryExtractPage(val);
+    const inner = parseProtobuf(val);
+    for (const [f2, w2, v2] of inner) {
+      if (w2 !== 2) continue;
+      tryExtractPage(v2);
+      const inner2 = parseProtobuf(v2);
+      for (const [f3, w3, v3] of inner2) {
+        if (w3 === 2) tryExtractPage(v3);
+      }
+    }
+  }
+
+  return [...new Map(pages.map(p => [p.imageUrl, p])).values()];
+}
+
+// Descriptografa com XOR (chave em hex, como o MangaPlus usa)
+function decryptImage(encryptedBuffer, encryptionKey) {
+  const keyBytes = Buffer.from(encryptionKey, 'hex');
+  const result = Buffer.alloc(encryptedBuffer.length);
+  for (let i = 0; i < encryptedBuffer.length; i++) {
+    result[i] = encryptedBuffer[i] ^ keyBytes[i % keyBytes.length];
+  }
+  return result;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ROTAS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q obrigatório' });
   console.log(`[SEARCH] "${query}"`);
 
-  // Fonte 1: WeebCentral via FlareSolverr
+  // 1. MangaPlus
   try {
-    const url = `https://weebcentral.com/search?query=${encodeURIComponent(query)}&type=series`;
-    const { html } = await fetchWithFlare(url);
-    if (!isCloudflareBlock(html)) {
-      const results = parseWeebSearch(html);
-      if (results.length > 0) {
-        console.log(`[SEARCH] WeebCentral: ${results.length}`);
-        return res.json({ results, source: 'weebcentral' });
-      }
-    } else {
-      console.warn('[SEARCH] WeebCentral: Cloudflare block');
+    const results = await mpSearchTitle(query);
+    if (results.length > 0) {
+      console.log(`[SEARCH] MangaPlus: ${results.length}`);
+      return res.json({ results, source: 'mangaplus' });
     }
-  } catch (e) {
-    console.warn(`[SEARCH] WeebCentral erro: ${e.message}`);
-  }
+  } catch (e) { console.warn('[SEARCH] MangaPlus erro:', e.message); }
 
-  // Fonte 2: MangaDex API
+  // 2. MangaDex
   try {
     const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`;
     const data = await fetchJSON(url);
@@ -139,79 +278,78 @@ app.get('/search', async (req, res) => {
       console.log(`[SEARCH] MangaDex: ${results.length}`);
       return res.json({ results, source: 'mangadex' });
     }
-  } catch (e) {
-    console.error(`[SEARCH] MangaDex erro: ${e.message}`);
-  }
+  } catch (e) { console.error('[SEARCH] MangaDex erro:', e.message); }
 
   res.json({ results: [], source: 'none' });
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /manga?id=...&source=...
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── GET /manga?id=...&source=... ─────────────────────────────────────────────
 app.get('/manga', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
   const { id, source } = req.query;
   if (!id) return res.status(400).json({ error: 'id obrigatório' });
   console.log(`[MANGA] id="${id}" source="${source}"`);
 
-  // WeebCentral
-  if (!source || source === 'weebcentral') {
+  if (source === 'mangaplus' || /^\d{5,7}$/.test(id)) {
     try {
-      const url = id.startsWith('http') ? id : `https://weebcentral.com/series/${id}`;
-      const { html } = await fetchWithFlare(url);
-      if (!isCloudflareBlock(html)) {
-        return res.json({ ...parseWeebManga(html), source: 'weebcentral' });
+      const detail = await mpGetTitle(id);
+      if (detail.title) {
+        console.log(`[MANGA] MangaPlus: "${detail.title}" | ${detail.chapters.length} caps`);
+        return res.json({ ...detail, source: 'mangaplus' });
       }
-    } catch (e) {
-      console.error(`[MANGA] WeebCentral erro: ${e.message}`);
-    }
+    } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); }
   }
 
-  // MangaDex
   try {
-    const detail = await fetchJSON(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`);
-    const m = detail.data;
+    const m = (await fetchJSON(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`)).data;
     const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
     const cover = m.relationships.find(r => r.type === 'cover_art');
     const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
+    const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
 
-    // Busca capítulos em PT-BR e EN
     let chapters = [];
     for (const lang of ['pt-br', 'en']) {
       try {
-        const chapData = await fetchJSON(
-          `https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`
-        );
+        const chapData = await fetchJSON(`https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`);
         if (chapData.data?.length > 0) {
           chapters = chapData.data.map(ch => ({
             id: ch.id,
             title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
             chapterNumber: ch.attributes.chapter || '0',
-            lang,
-            source: 'mangadex',
+            lang, source: 'mangadex',
           }));
           break;
         }
       } catch (_) {}
     }
-
-    return res.json({ title, coverUrl, description: m.attributes.description?.en || m.attributes.description?.['pt-br'] || '', chapters, source: 'mangadex' });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
-  }
+    return res.json({ title, coverUrl, description: desc, chapters, source: 'mangadex' });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /chapter?id=...&source=...&url=...
-// Para One Piece e títulos sem páginas no MangaDex:
-//   usa WeebCentral via FlareSolverr buscando pelo título
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── GET /chapter?id=...&source=... ───────────────────────────────────────────
 app.get('/chapter', async (req, res) => {
-  const { id, url: chUrl, source, title, chapterNumber } = req.query;
-  console.log(`[CHAPTER] id="${id}" source="${source}" title="${title}" ch="${chapterNumber}"`);
+  res.setHeader('Content-Type', 'application/json');
+  const { id, source } = req.query;
+  if (!id) return res.status(400).json({ error: 'id obrigatório' });
+  console.log(`[CHAPTER] id="${id}" source="${source}"`);
 
-  // 1. MangaDex direto (funciona para a maioria dos títulos)
-  if (id && (source === 'mangadex' || isUuid(id))) {
+  // MangaPlus — retorna URLs do /image-proxy que descriptografa XOR
+  if (source === 'mangaplus' || /^\d{5,9}$/.test(id)) {
+    try {
+      const pageData = await mpGetChapterPages(id);
+      if (pageData.length > 0) {
+        const baseUrl = `${req.protocol}://${req.get('host')}`;
+        const pages = pageData.map(p =>
+          `${baseUrl}/image-proxy?url=${encodeURIComponent(p.imageUrl)}&key=${encodeURIComponent(p.encryptionKey)}`
+        );
+        console.log(`[CHAPTER] MangaPlus: ${pages.length} páginas`);
+        return res.json({ pages, source: 'mangaplus' });
+      }
+    } catch (e) { console.error('[CHAPTER] MangaPlus erro:', e.message); }
+  }
+
+  // MangaDex
+  if (isUuid(id)) {
     try {
       const data = await fetchJSON(`https://api.mangadex.org/at-home/server/${id}`);
       const base = data.baseUrl, hash = data.chapter?.hash;
@@ -220,133 +358,68 @@ app.get('/chapter', async (req, res) => {
         console.log(`[CHAPTER] MangaDex: ${pages.length} páginas`);
         return res.json({ pages, source: 'mangadex' });
       }
-      console.warn('[CHAPTER] MangaDex: 0 páginas (DMCA), tentando WeebCentral');
-    } catch (e) {
-      console.warn(`[CHAPTER] MangaDex erro: ${e.message}`);
-    }
+    } catch (e) { console.warn('[CHAPTER] MangaDex erro:', e.message); }
   }
 
-  // 2. WeebCentral via FlareSolverr
-  //    Precisa do título do mangá e número do capítulo para achar no WeebCentral
-  if (title && chapterNumber) {
-    try {
-      // Busca o mangá no WeebCentral
-      const searchUrl = `https://weebcentral.com/search?query=${encodeURIComponent(title)}&type=series`;
-      const { html: searchHtml } = await fetchWithFlare(searchUrl);
-
-      if (!isCloudflareBlock(searchHtml)) {
-        const results = parseWeebSearch(searchHtml);
-        if (results.length > 0) {
-          const seriesId = results[0].id;
-          // Abre a página da série
-          const seriesUrl = `https://weebcentral.com/series/${seriesId}`;
-          const { html: seriesHtml } = await fetchWithFlare(seriesUrl);
-
-          if (!isCloudflareBlock(seriesHtml)) {
-            const manga = parseWeebManga(seriesHtml);
-            // Acha o capítulo pelo número
-            const chapter = manga.chapters.find(c =>
-              parseFloat(c.chapterNumber) === parseFloat(chapterNumber)
-            ) || manga.chapters[0];
-
-            if (chapter) {
-              // Pega as páginas do capítulo
-              const imgUrl = `https://weebcentral.com/chapters/${chapter.id}/images?is_prev=False&current_page=1&reading_style=long_strip`;
-              const { html: imgHtml } = await fetchWithFlare(imgUrl, seriesUrl);
-              const pages = parseWeebPages(imgHtml);
-              if (pages.length > 0) {
-                console.log(`[CHAPTER] WeebCentral: ${pages.length} páginas`);
-                return res.json({ pages, source: 'weebcentral' });
-              }
-            }
-          }
-        }
-      }
-    } catch (e) {
-      console.error(`[CHAPTER] WeebCentral erro: ${e.message}`);
-    }
-  }
-
-  // 3. URL direta
-  if (chUrl) {
-    try {
-      const { html } = await fetchWithFlare(chUrl);
-      const pages = parseWeebPages(html);
-      if (pages.length > 0) return res.json({ pages, source: 'url' });
-    } catch (e) {
-      console.error(`[CHAPTER] URL erro: ${e.message}`);
-    }
-  }
-
-  res.json({ pages: [], source: 'none', error: 'Nenhuma fonte retornou páginas. Tente passar title= e chapterNumber= na requisição.' });
+  res.json({ pages: [], source: 'none', error: 'Nenhuma fonte retornou páginas.' });
 });
 
-// ─── Parsers WeebCentral ──────────────────────────────────────────────────────
+// ─── GET /image-proxy?url=...&key=... ─────────────────────────────────────────
+// Baixa imagem criptografada do MangaPlus, descriptografa com XOR e serve
+app.get('/image-proxy', async (req, res) => {
+  const { url, key } = req.query;
+  if (!url) return res.status(400).send('url obrigatório');
 
-function parseWeebSearch(html) {
-  const results = [];
-  const re = /href="https:\/\/weebcentral\.com\/series\/([A-Z0-9]{26})"[^>]*>([\s\S]*?)(?=href="|<\/(?:li|section|ul))/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const id = m[1];
-    const block = m[2];
-    const titleM = block.match(/<strong[^>]*>([^<]+)<\/strong>/) || block.match(/alt="([^"]{3,80})"/);
-    const imgM = block.match(/src="(https:\/\/[^"]+\.(?:jpg|png|webp)[^"]*)"/);
-    if (titleM) {
-      results.push({
-        id, title: titleM[1].trim(),
-        coverUrl: imgM ? imgM[1] : null,
-        url: `https://weebcentral.com/series/${id}`,
-        source: 'weebcentral',
-      });
-    }
+  try {
+    const { buffer, status } = await fetchRaw(decodeURIComponent(url), MP_HEADERS);
+    if (status !== 200) return res.status(status).send('Erro ao buscar imagem');
+
+    const decrypted = key ? decryptImage(buffer, decodeURIComponent(key)) : buffer;
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(decrypted);
+  } catch (e) {
+    console.error('[IMAGE-PROXY] erro:', e.message);
+    res.status(500).send('Erro interno');
   }
-  return [...new Map(results.map(r => [r.id, r])).values()];
-}
+});
 
-function parseWeebManga(html) {
-  const title = (html.match(/<h1[^>]*>([^<]+)<\/h1>/) || [])[1]?.trim() || '';
-  const coverM = html.match(/class="[^"]*lazy[^"]*"[^>]*src="([^"]+)"/) ||
-                 html.match(/<img[^>]*src="(https:\/\/[^"]*(?:cover|thumb)[^"]+)"/i);
-  const coverUrl = coverM ? coverM[1] : null;
-  const descM = html.match(/class="[^"]*description[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/);
-  const description = descM ? descM[1].replace(/<[^>]+>/g, '').trim() : '';
+// ─── GET /mangaplus/all ────────────────────────────────────────────────────────
+// Lista todo o catálogo MangaPlus
+app.get('/mangaplus/all', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { buffer } = await fetchRaw(`${MP_API}/title_list/allV3`, MP_HEADERS);
+    const topFields = parseProtobuf(buffer);
+    const titles = [];
 
-  const chapters = [];
-  const re = /href="https:\/\/weebcentral\.com\/chapters\/([A-Z0-9]{26})"[^>]*>([\s\S]*?)(?=href="|<\/(?:li|section))/g;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const chapId = m[1];
-    const block = m[2];
-    const numM = block.match(/Chapter\s+(\d+\.?\d*)/i) || block.match(/(\d+\.?\d*)/);
-    if (chapId) {
-      chapters.push({
-        id: chapId,
-        title: `Capítulo ${numM ? numM[1] : '?'}`,
-        chapterNumber: numM ? numM[1] : '0',
-        source: 'weebcentral',
-      });
+    for (const [fn, wt, val] of topFields) {
+      if (wt !== 2) continue;
+      const inner = parseProtobuf(val);
+      for (const [f2, w2, v2] of inner) {
+        if (w2 !== 2) continue;
+        const inner2 = parseProtobuf(v2);
+        for (const [f3, w3, v3] of inner2) {
+          if (w3 !== 2) continue;
+          const t = parseProtobuf(v3);
+          let titleId = null, name = null, cover = null;
+          for (const [f4, w4, v4] of t) {
+            if (f4 === 1 && w4 === 0) titleId = v4;
+            if (f4 === 2 && w4 === 2) { try { name = pbStr(v4); } catch(_) {} }
+            if (f4 === 23 && w4 === 2) { try { cover = pbStr(v4); } catch(_) {} }
+          }
+          if (titleId && name) titles.push({ id: String(titleId), title: name, coverUrl: cover, source: 'mangaplus' });
+        }
+      }
     }
-  }
-  return { title, coverUrl, description, chapters };
-}
 
-function parseWeebPages(html) {
-  const pages = [];
-  const re = /<img[^>]*src="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
-  let m;
-  while ((m = re.exec(html)) !== null) {
-    const u = m[1];
-    if (!u.includes('icon') && !u.includes('logo') && !u.includes('avatar') && !u.includes('favicon')) {
-      pages.push(u);
-    }
-  }
-  const re2 = /data-src="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
-  while ((m = re2.exec(html)) !== null) pages.push(m[1]);
-  return [...new Set(pages)];
-}
+    res.json({ total: titles.length, titles });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Manga Proxy na porta ${PORT} | FlareSolverr: ${FLARESOLVERR_URL || 'não configurado'}`);
+  console.log(`Manga Proxy v3 na porta ${PORT}`);
+  console.log(`MangaPlus integrado | FlareSolverr: ${FLARESOLVERR_URL || 'nao configurado'}`);
 });
