@@ -1,6 +1,7 @@
 const express = require('express');
 const https = require('https');
 const http = require('http');
+const { randomUUID } = require('crypto'); // nativo do Node 18+
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -34,23 +35,10 @@ function isUuid(s) {
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  PROTOBUF READER MANUAL (sem dependências externas)
-//
-//  Field numbers confirmados nos endpoints v3 do MangaPlus (2024/2025):
-//    Response         → success: field 1
-//    SuccessResult    → allTitlesView: field 4 | titleDetailView: field 8 | mangaViewer: field 10
-//    AllTitlesView    → titles[]: field 1
-//    Title            → titleId:1 name:2 author:3 portraitImageUrl:4
-//    TitleDetailView  → title:1 overview:2 firstChapterList:6 lastChapterList:7
-//    Chapter          → titleId:1 chapterId:2 name:3 subTitle:4
-//    MangaViewer      → pages[]: field 1
-//    Page             → mangaPage: field 1
-//    MangaPage        → imageUrl:1 width:2 height:3 encryptionKey:4
+//  PROTOBUF READER MANUAL
 // ══════════════════════════════════════════════════════════════════════════════
 
 function readPB(buf) {
-  // Retorna Map: fieldNum → [values...]
-  // Cada value é: number (varint/fixed) ou Buffer (length-delimited)
   const fields = {};
   let pos = 0;
 
@@ -80,12 +68,22 @@ function readPB(buf) {
 const s = b => Buffer.from(b).toString('utf8');
 const pb = b => Buffer.from(b);
 
-// Endpoints atuais do MangaPlus (confirmados em 2024/2025):
+// ─── MangaPlus config ──────────────────────────────────────────────────────────
 const MP = 'https://jumpg-webapi.tokyo-cdn.com/api';
-const MP_HDR = { 'Origin': 'https://mangaplus.shueisha.co.jp', 'Referer': 'https://mangaplus.shueisha.co.jp/', 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' };
+
+// ⚠️  SESSION-TOKEN é OBRIGATÓRIO — sem ele a API retorna buffer de erro (~1353b)
+// Gerado novo a cada requisição com randomUUID() nativo do Node 18
+function mpHeaders() {
+  return {
+    'Origin': 'https://mangaplus.shueisha.co.jp',
+    'Referer': 'https://mangaplus.shueisha.co.jp/',
+    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+    'SESSION-TOKEN': randomUUID(),  // ← a correção principal
+  };
+}
 
 async function mpRaw(path) {
-  const { buffer, status } = await fetchRaw(`${MP}${path}`, MP_HDR);
+  const { buffer, status } = await fetchRaw(`${MP}${path}`, mpHeaders());
   if (status !== 200) throw new Error(`HTTP ${status} para ${path}`);
   return buffer;
 }
@@ -104,8 +102,8 @@ function decodeChapter(b) {
   const f = readPB(pb(b));
   return {
     chapterId: f[2]?.[0] || 0,
-    name: f[3]?.[0] ? s(f[3][0]) : '',     // número "1", "1181"
-    subTitle: f[4]?.[0] ? s(f[4][0]) : '', // nome do capítulo
+    name: f[3]?.[0] ? s(f[3][0]) : '',
+    subTitle: f[4]?.[0] ? s(f[4][0]) : '',
   };
 }
 
@@ -113,11 +111,10 @@ function decodePage(b) {
   const f = readPB(pb(b));
   return {
     imageUrl: f[1]?.[0] ? s(f[1][0]) : '',
-    encryptionKey: f[5]?.[0] ? s(f[5][0]) : '',  // field 5 confirmado pelo debug
+    encryptionKey: f[5]?.[0] ? s(f[5][0]) : '',
   };
 }
 
-// Navega pela resposta e extrai o bloco success
 function getSuccess(raw) {
   const resp = readPB(raw);
   const successBuf = resp[1]?.[0];
@@ -126,10 +123,8 @@ function getSuccess(raw) {
 }
 
 async function mpSearch(query) {
-  // allV3 é o endpoint atual (allV2 foi deprecado)
   const raw = await mpRaw('/title_list/allV3?language=0');
   const success = getSuccess(raw);
-  // allTitlesView = field 4 dentro do success
   const atv = success[4]?.[0];
   if (!atv) throw new Error('allTitlesView(4) não encontrado. Fields: ' + Object.keys(success).join(','));
   const titles = readPB(pb(atv))[1] || [];
@@ -144,13 +139,11 @@ async function mpGetTitle(titleId) {
   const raw = await mpRaw(`/title_detail_v3?title_id=${titleId}&language=0`);
   const success = getSuccess(raw);
   const tdv = success[8]?.[0];
-  if (!tdv) throw new Error('titleDetailView(8) nao encontrado. Fields: ' + Object.keys(success).join(','));
+  if (!tdv) throw new Error('titleDetailView(8) não encontrado. Fields: ' + Object.keys(success).join(','));
   const detail = readPB(pb(tdv));
 
-  // field 1 = Title object
   const titleInfo = detail[1]?.[0] ? decodeTitle(detail[1][0]) : {};
 
-  // field 28 = chapterListGroup[] { name(1), firstChapterList(2)[], lastChapterList(4)[] }
   const chapters = [];
   const seen = new Set();
   for (const groupBuf of (detail[28] || [])) {
@@ -180,13 +173,12 @@ async function mpGetTitle(titleId) {
 async function mpGetPages(chapterId) {
   const raw = await mpRaw(`/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`);
   const success = getSuccess(raw);
-  // mangaViewer = field 10
   const viewer = success[10]?.[0];
   if (!viewer) throw new Error('mangaViewer(10) não encontrado. Fields: ' + Object.keys(success).join(','));
   const pages = readPB(pb(viewer))[1] || [];
-  return pages.map(pb => {
-    const page = readPB(Buffer.from(pb));
-    const mp = page[1]?.[0]; // mangaPage = field 1
+  return pages.map(p => {
+    const page = readPB(Buffer.from(p));
+    const mp = page[1]?.[0];
     return mp ? decodePage(mp) : null;
   }).filter(p => p?.imageUrl);
 }
@@ -200,78 +192,28 @@ function xorDecrypt(buf, hexKey) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '6.2-fixed' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '7.0-session-token' }));
 
-// ─── DEBUG2 — estrutura do manga_viewer ──────────────────────────────────────────
-app.get('/debug2', async (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  const chapterId = req.query.id || '7000036';
-  try {
-    // Testa vários endpoints de viewer
-    const endpoints = [
-      `/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`,
-      `/manga_viewer?chapter_id=${chapterId}&split=no&img_quality=super_high`,
-      `/manga_viewer_v2?chapter_id=${chapterId}&split=yes&img_quality=super_high`,
-    ];
-    const results = {};
-    for (const ep of endpoints) {
-      try {
-        const raw = await mpRaw(ep);
-        const resp = readPB(raw);
-        const successBuf = resp[1]?.[0];
-        const success = successBuf ? readPB(pb(successBuf)) : {};
-        results[ep] = {
-          size: raw.length,
-          topFields: Object.keys(resp).join(','),
-          successFields: Object.keys(success).join(','),
-          hex30: raw.slice(0, 30).toString('hex'),
-        };
-        // Se tiver field 10 (mangaViewer), vai fundo
-        if (success[10]?.[0]) {
-          const viewer = readPB(pb(success[10][0]));
-          results[ep].viewerFields = Object.keys(viewer).join(',');
-          results[ep].pageCount = (viewer[1] || []).length;
-          // Mostra o primeiro page
-          if (viewer[1]?.[0]) {
-            const page = readPB(pb(viewer[1][0]));
-            results[ep].firstPageFields = Object.keys(page).join(',');
-            if (page[1]?.[0]) {
-              const mp = readPB(pb(page[1][0]));
-              results[ep].firstMangaPageFields = Object.keys(mp).join(',');
-              if (mp[1]?.[0]) results[ep].firstImageUrl = s(mp[1][0]).slice(0, 80);
-            }
-          }
-        }
-      } catch(e) {
-        results[ep] = { error: e.message };
-      }
-    }
-    res.json(results);
-  } catch (e) { res.json({ error: e.message }); }
-});
-
-// ─── DEBUG — mostra a estrutura real da resposta ───────────────────────────────
+// ─── DEBUG — estrutura da resposta ────────────────────────────────────────────
 app.get('/debug', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   const titleId = req.query.id || '700005';
-  const endpoint = req.query.ep || `/title_detail_v3?title_id=${titleId}`;
+  const endpoint = req.query.ep || `/title_detail_v3?title_id=${titleId}&language=0`;
   try {
     const raw = await mpRaw(endpoint);
     const resp = readPB(raw);
     const successBuf = resp[1]?.[0];
+    if (!successBuf) return res.json({ error: 'sem success', size: raw.length, hex: raw.slice(0,40).toString('hex') });
     const success = readPB(pb(successBuf));
     const tdvBuf = success[8]?.[0];
+    if (!tdvBuf) return res.json({ error: 'sem titleDetailView', successFields: Object.keys(success).join(',') });
     const tdv = readPB(pb(tdvBuf));
-
-    // Mostra cada field do titleDetailView com tipo e preview
     const fieldInfo = {};
     for (const [fn, vals] of Object.entries(tdv)) {
       fieldInfo[fn] = vals.map(v => {
         if (typeof v === 'number') return { type: 'varint', value: v };
         const str = Buffer.from(v).toString('utf8');
-        const isPrintable = /^[\x20-\x7E\u00C0-\uFFFF]*$/.test(str);
-        if (isPrintable && str.length < 200) return { type: 'string', value: str };
-        // tenta parsear como sub-message
+        if (/^[\x20-\x7E\u00C0-\uFFFF]*$/.test(str) && str.length < 200) return { type: 'string', value: str };
         try {
           const sub = readPB(Buffer.from(v));
           const subInfo = {};
@@ -287,9 +229,34 @@ app.get('/debug', async (req, res) => {
       });
     }
     res.json({ endpoint, size: raw.length, titleDetailViewFields: fieldInfo });
-  } catch (e) {
-    res.json({ error: e.message, endpoint });
-  }
+  } catch (e) { res.json({ error: e.message }); }
+});
+
+// ─── DEBUG2 — estrutura do manga_viewer ──────────────────────────────────────
+app.get('/debug2', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const chapterId = req.query.id || '7000036';
+  try {
+    const raw = await mpRaw(`/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`);
+    const resp = readPB(raw);
+    const successBuf = resp[1]?.[0];
+    if (!successBuf) return res.json({ error: 'sem success', size: raw.length });
+    const success = readPB(pb(successBuf));
+    const viewerBuf = success[10]?.[0];
+    if (!viewerBuf) return res.json({ error: 'sem mangaViewer', successFields: Object.keys(success).join(',') });
+    const viewer = readPB(pb(viewerBuf));
+    const pageCount = (viewer[1] || []).length;
+    let firstImageUrl = null, firstKey = null;
+    if (viewer[1]?.[0]) {
+      const page = readPB(pb(viewer[1][0]));
+      const mp = page[1]?.[0] ? readPB(pb(page[1][0])) : null;
+      if (mp) {
+        firstImageUrl = mp[1]?.[0] ? s(mp[1][0]) : null;
+        firstKey = mp[5]?.[0] ? s(mp[5][0]) : null;
+      }
+    }
+    res.json({ chapterId, size: raw.length, pageCount, firstImageUrl, firstKey });
+  } catch (e) { res.json({ error: e.message }); }
 });
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
@@ -301,8 +268,11 @@ app.get('/search', async (req, res) => {
 
   try {
     const results = await mpSearch(q);
-    if (results.length > 0) { console.log(`[SEARCH] MangaPlus: ${results.length}`); return res.json({ results, source: 'mangaplus' }); }
-    console.log('[SEARCH] MangaPlus: 0 resultados');
+    if (results.length > 0) {
+      console.log(`[SEARCH] MangaPlus: ${results.length}`);
+      return res.json({ results, source: 'mangaplus' });
+    }
+    console.log('[SEARCH] MangaPlus: 0 resultados, tentando MangaDex');
   } catch (e) { console.warn('[SEARCH] MangaPlus erro:', e.message); }
 
   try {
@@ -345,8 +315,16 @@ app.get('/manga', async (req, res) => {
     let chapters = [];
     for (const lang of ['pt-br', 'en']) {
       try {
-        const cd = (await fetchJSON(`https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`)).data;
-        if (cd.data?.length > 0) { chapters = cd.data.map(ch => ({ id: ch.id, title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`, chapterNumber: ch.attributes.chapter || '0', lang, source: 'mangadex' })); break; }
+        const cd = await fetchJSON(`https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`);
+        if (cd.data?.length > 0) {
+          chapters = cd.data.map(ch => ({
+            id: ch.id,
+            title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
+            chapterNumber: ch.attributes.chapter || '0',
+            lang, source: 'mangadex',
+          }));
+          break;
+        }
       } catch (_) {}
     }
     return res.json({ title, coverUrl, description: desc, chapters, source: 'mangadex' });
@@ -365,7 +343,9 @@ app.get('/chapter', async (req, res) => {
       const pageData = await mpGetPages(id);
       if (pageData.length > 0) {
         const base = `${req.protocol}://${req.get('host')}`;
-        const pages = pageData.map(p => `${base}/image-proxy?url=${encodeURIComponent(p.imageUrl)}${p.encryptionKey ? '&key=' + encodeURIComponent(p.encryptionKey) : ''}`);
+        const pages = pageData.map(p =>
+          `${base}/image-proxy?url=${encodeURIComponent(p.imageUrl)}${p.encryptionKey ? '&key=' + encodeURIComponent(p.encryptionKey) : ''}`
+        );
         console.log(`[CHAPTER] MangaPlus: ${pages.length} páginas`);
         return res.json({ pages, source: 'mangaplus' });
       }
@@ -376,7 +356,10 @@ app.get('/chapter', async (req, res) => {
     try {
       const data = await fetchJSON(`https://api.mangadex.org/at-home/server/${id}`);
       const pages = (data.chapter?.data || []).map(f => `${data.baseUrl}/data/${data.chapter.hash}/${f}`);
-      if (pages.length > 0) { console.log(`[CHAPTER] MangaDex: ${pages.length} páginas`); return res.json({ pages, source: 'mangadex' }); }
+      if (pages.length > 0) {
+        console.log(`[CHAPTER] MangaDex: ${pages.length} páginas`);
+        return res.json({ pages, source: 'mangadex' });
+      }
     } catch (e) { console.warn('[CHAPTER] MangaDex erro:', e.message); }
   }
 
@@ -388,7 +371,9 @@ app.get('/image-proxy', async (req, res) => {
   const { url, key } = req.query;
   if (!url) return res.status(400).send('url obrigatório');
   try {
-    const { buffer, status } = await fetchRaw(decodeURIComponent(url), { 'Referer': 'https://mangaplus.shueisha.co.jp/' });
+    const { buffer, status } = await fetchRaw(decodeURIComponent(url), {
+      'Referer': 'https://mangaplus.shueisha.co.jp/',
+    });
     if (status !== 200) return res.status(status).send('Erro ' + status);
     const result = key ? xorDecrypt(buffer, decodeURIComponent(key)) : buffer;
     res.setHeader('Content-Type', 'image/jpeg');
@@ -398,4 +383,4 @@ app.get('/image-proxy', async (req, res) => {
   } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
-app.listen(PORT, () => console.log(`Manga Proxy v6.2 (encKey field5 + lang EN) na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Manga Proxy v7.0 (SESSION-TOKEN fix) na porta ${PORT}`));
