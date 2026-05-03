@@ -316,74 +316,78 @@ async function comickSearch(query) {
   }
 }
 
-async function comickGetManga(mangaIdOrUrl) {
+async function comickGetManga(mangaId) {
   try {
-    console.log(`[COMICK] getManga: "${mangaIdOrUrl}"`);
+    console.log(`[COMICK] getManga: "${mangaId}"`);
     
-    let mangaUrl = mangaIdOrUrl;
+    // Busca com o ID como query
+    const searchResp = await fetchPOST(
+      `${COMICK_BASE}/search`,
+      { query: mangaId, source: "all" }
+    );
+    const searchText = searchResp.buffer.toString('utf8');
+    const searchObjects = searchText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
     
-    // Se não parece URL, faz busca
-    if (!mangaIdOrUrl.includes('http')) {
-      const searchResp = await fetchPOST(
-        `${COMICK_BASE}/search`,
-        { query: mangaIdOrUrl, source: "all" }
-      );
-      const searchText = searchResp.buffer.toString('utf8');
-      const searchObjects = searchText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
-      
-      for (const jsonStr of searchObjects) {
-        try {
-          const obj = JSON.parse(jsonStr);
-          if (obj.results && obj.results[0]) {
-            mangaUrl = obj.results[0].url;
-            console.log(`[COMICK] URL encontrada: ${mangaUrl}`);
+    let mangaUrl = null;
+    let title = mangaId;
+    
+    // Procura resultado com ID exato OU título similar
+    for (const jsonStr of searchObjects) {
+      try {
+        const obj = JSON.parse(jsonStr);
+        if (obj.results && obj.results[0]) {
+          const result = obj.results[0];
+          // Se ID bate OU título contém o ID
+          if (result.id === mangaId || result.title.toLowerCase().includes(mangaId.toLowerCase())) {
+            mangaUrl = result.url;
+            title = result.title;
+            console.log(`[COMICK] Match exato: ${title} -> ${mangaUrl}`);
             break;
           }
-        } catch {}
-      }
+        }
+      } catch {}
     }
     
-    if (!mangaUrl || !mangaUrl.startsWith('http')) {
-      return { title: mangaIdOrUrl, chapters: [], source: 'comick' };
+    if (!mangaUrl) {
+      console.log('[COMICK] Nenhum match exato');
+      return { title, chapters: [], source: 'comick' };
     }
-    
-    console.log(`[COMICK] URL encontrada: ${mangaUrl}`);
     
     // Pega capítulos
+    console.log(`[COMICK] Buscando capítulos em: ${mangaUrl}`);
     const chaptersResp = await fetchPOST(
       `${COMICK_BASE}/chapters`,
       { url: mangaUrl }
     );
     const chaptersText = chaptersResp.buffer.toString('utf8');
-    
-    // Parse stream de capítulos
     const chaptersObjects = chaptersText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+    
     let chapters = [];
     for (const jsonStr of chaptersObjects) {
       try {
         const obj = JSON.parse(jsonStr);
         if (obj.chapters && Array.isArray(obj.chapters)) {
           chapters = obj.chapters.map(c => ({
-            id: c.id,
+            id: `${mangaId}-${c.id}`,  // ID único
             title: c.title || `Cap ${c.number}`,
             chapterNumber: c.number,
             source: 'comick'
           }));
+          console.log(`[COMICK] ${chapters.length} capítulos OK`);
           break;
         }
       } catch {}
     }
     
-    console.log(`[COMICK] ${chapters.length} capítulos encontrados`);
     return {
-      title: mangaId,
-      coverUrl: null,  // já tem da busca
-      description: `${chapters.length} capítulos disponíveis`,
+      title,
+      coverUrl: null,
+      description: `${chapters.length} capítulos`,
       chapters,
       source: 'comick'
     };
   } catch (e) {
-    console.error('[COMICK] getManga erro:', e.message);
+    console.error('[COMICK] erro:', e.message);
     return { title: mangaId, chapters: [], source: 'comick' };
   }
 }
