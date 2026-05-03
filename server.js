@@ -502,13 +502,16 @@ async function comickGetPages(chapterHid) {
 //  MANGADEX — completo com PT-BR primeiro, fallback EN
 // ══════════════════════════════════════════════════════════════════════════════
 
-async function mdxSearch(query) {
-  const cached = getCachedSearch('mangadex', query);
+async function mdxSearch(query, filterLang = null) {
+  const cacheKey = filterLang ? `${query}__lang_${filterLang}` : query;
+  const cached = getCachedSearch('mangadex', cacheKey);
   if (cached) { console.log('[MDX] cache hit'); return cached; }
 
   try {
+    // Se filterLang especificado, filtra só mangás com tradução nesse idioma
+    const langFilter = filterLang ? `&availableTranslatedLanguage[]=${filterLang}` : '';
     const data = await fetchJSON(
-      `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica`,
+      `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica${langFilter}`,
       { 'User-Agent': 'MangaHook/1.0 (educational)' }
     );
     if (!data.data?.length) return [];
@@ -516,6 +519,7 @@ async function mdxSearch(query) {
       const title = m.attributes.title['pt-br'] || m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
       const cover = m.relationships.find(r => r.type === 'cover_art');
       const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
+      const langs = m.attributes.availableTranslatedLanguages || [];
       return {
         id: m.id,
         title,
@@ -523,34 +527,80 @@ async function mdxSearch(query) {
         description: desc.slice(0, 200),
         status: m.attributes.status || '',
         year: m.attributes.year || null,
+        hasPtBr: langs.includes('pt-br') || langs.includes('pt'),
+        availableLangs: langs,
         source: 'mangadex'
       };
     });
-    setCachedSearch('mangadex', query, results);
+    setCachedSearch('mangadex', cacheKey, results);
     return results;
   } catch (e) { console.warn('[MDX] search erro:', e.message); return []; }
 }
 
 // Busca todos os capítulos de um idioma específico com paginação automática
+// IDs de grupos de scan brasileiros conhecidos no MangaDex
+// Esses grupos têm prioridade na seleção de capítulos PT-BR
+const MDX_BR_GROUPS = new Set([
+  'b34e5f20-7a2b-4df4-b3ff-b31620fcdbc5', // Tatakae Scan
+  '8d8946aa-781a-4c4e-bc2a-60e7a75cd4c4', // Sakura Mangas
+  'a5a4b5b6-c5c6-4d4e-5e5f-6a6b7c7d8e8f', // LerMangas (placeholder - atualizar se encontrar)
+  'caa26a46-9447-4c85-a3c5-4a5b3b5c6d6e', // Taiyo Scans (placeholder)
+]);
+
 async function mdxFetchChaptersForLang(mangaId, lang) {
   const allChapters = [];
   const ratings = 'contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica';
   const langParam = `&translatedLanguage[]=${lang}`;
+  // Inclui scanlation_group para poder priorizar grupos BR
+  const includes = '&includes[]=scanlation_group';
   const limit = 500;
   let offset = 0;
   let total = null;
 
   while (true) {
-    const url = `https://api.mangadex.org/manga/${mangaId}/feed?${langParam}&order[chapter]=asc&limit=${limit}&offset=${offset}&${ratings}`;
+    const url = `https://api.mangadex.org/manga/${mangaId}/feed?${langParam}&order[chapter]=asc&limit=${limit}&offset=${offset}&${ratings}${includes}`;
     const cd = await fetchJSON(url, { 'User-Agent': 'MangaHook/1.0 (educational)' });
     if (!cd.data?.length) break;
     allChapters.push(...cd.data);
     if (total === null) total = cd.total || 0;
     offset += cd.data.length;
     if (offset >= total || cd.data.length < limit) break;
+    // Pequena pausa entre requests para não bater no rate limit do MDX (5 req/s)
+    await new Promise(r => setTimeout(r, 250));
   }
 
   return allChapters;
+}
+
+// Verifica se um capítulo foi feito por um grupo BR conhecido
+function isBrGroup(ch) {
+  const groups = ch.relationships?.filter(r => r.type === 'scanlation_group') || [];
+  return groups.some(g => MDX_BR_GROUPS.has(g.id));
+}
+
+// Deduplica capítulos: mesmo número → prioriza grupo BR, depois mais páginas
+function deduplicateChapters(rawChapters) {
+  const chapMap = new Map();
+  for (const ch of rawChapters) {
+    const num = ch.attributes.chapter ?? ch.attributes.title ?? ch.id;
+    const existing = chapMap.get(num);
+    if (!existing) { chapMap.set(num, ch); continue; }
+
+    const newIsBr = isBrGroup(ch);
+    const oldIsBr = isBrGroup(existing);
+    const newPages = ch.attributes.pages || 0;
+    const oldPages = existing.attributes.pages || 0;
+
+    // Prefere grupo BR; se empate, prefere mais páginas
+    if (newIsBr && !oldIsBr) { chapMap.set(num, ch); }
+    else if (!newIsBr && oldIsBr) { /* mantém existing */ }
+    else if (newPages > oldPages) { chapMap.set(num, ch); }
+  }
+  return [...chapMap.values()].sort((a, b) => {
+    const na = parseFloat(a.attributes.chapter) || 0;
+    const nb = parseFloat(b.attributes.chapter) || 0;
+    return nb - na; // mais recente primeiro
+  });
 }
 
 async function mdxGetManga(mangaId) {
@@ -566,54 +616,53 @@ async function mdxGetManga(mangaId) {
   const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
   const author = m.relationships.find(r => r.type === 'author');
 
-  // Estratégia de idioma: PT-BR → PT → EN  — NUNCA mistura idiomas
-  // Cada tentativa busca UM idioma limpo. Para quando acha capítulos.
+  // Verifica idiomas disponíveis primeiro (evita requests inúteis)
+  const availLangs = m.attributes.availableTranslatedLanguages || [];
+  console.log(`[MDX] "${title}" | langs disponíveis: [${availLangs.join(', ')}]`);
+
+  // Estratégia: PT-BR → PT → EN — NUNCA mistura idiomas
   let rawChapters = [];
   let usedLang = null;
 
-  for (const lang of ['pt-br', 'pt', 'en']) {
+  const langsToTry = ['pt-br', 'pt', 'en'].filter(l =>
+    availLangs.length === 0 || availLangs.includes(l)
+  );
+  // Se nenhum dos preferidos está disponível, tenta EN de qualquer jeito como último recurso
+  if (!langsToTry.includes('en')) langsToTry.push('en');
+
+  for (const lang of langsToTry) {
     try {
       const data = await mdxFetchChaptersForLang(mangaId, lang);
       if (data.length > 0) {
         rawChapters = data;
         usedLang = lang;
-        console.log(`[MDX] ${data.length} capítulos raw em "${lang}"`);
+        console.log(`[MDX] ${data.length} caps raw em "${lang}"`);
         break;
       }
     } catch (e) {
-      console.warn(`[MDX] erro buscando lang="${lang}":`, e.message);
+      console.warn(`[MDX] erro lang="${lang}":`, e.message);
     }
   }
 
-  // Deduplica por número de capítulo (mesmo idioma pode ter múltiplos grupos)
-  // Mantém o capítulo com mais pages (qualidade) ou o primeiro se igual
-  const chapMap = new Map();
-  for (const ch of rawChapters) {
-    const num = ch.attributes.chapter ?? ch.attributes.title ?? ch.id;
-    const existing = chapMap.get(num);
-    const pages = ch.attributes.pages || 0;
-    if (!existing || pages > (existing.attributes.pages || 0)) {
-      chapMap.set(num, ch);
-    }
-  }
+  const sorted = deduplicateChapters(rawChapters);
 
-  // Ordena do maior capítulo para o menor (mais recente primeiro no app)
-  const sorted = [...chapMap.values()].sort((a, b) => {
-    const na = parseFloat(a.attributes.chapter) || 0;
-    const nb = parseFloat(b.attributes.chapter) || 0;
-    return nb - na;
+  const chapters = sorted.map(ch => {
+    const groups = (ch.relationships || [])
+      .filter(r => r.type === 'scanlation_group')
+      .map(r => r.attributes?.name || r.id)
+      .filter(Boolean);
+    return {
+      id: ch.id,
+      title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
+      chapterNumber: ch.attributes.chapter || '0',
+      volume: ch.attributes.volume || null,
+      lang: usedLang,
+      groups,
+      source: 'mangadex'
+    };
   });
 
-  const chapters = sorted.map(ch => ({
-    id: ch.id,
-    title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
-    chapterNumber: ch.attributes.chapter || '0',
-    volume: ch.attributes.volume || null,
-    lang: usedLang,
-    source: 'mangadex'
-  }));
-
-  console.log(`[MDX] "${title}" | ${chapters.length} capítulos únicos em "${usedLang || 'nenhum'}"`);
+  console.log(`[MDX] "${title}" | ${chapters.length} caps únicos em "${usedLang || 'nenhum'}"`);
 
   return {
     title,
@@ -622,6 +671,7 @@ async function mdxGetManga(mangaId) {
     author: author?.attributes?.name || '',
     status: m.attributes.status || '',
     year: m.attributes.year || null,
+    availableLangs: availLangs,
     chapters,
     source: 'mangadex'
   };
@@ -805,23 +855,23 @@ function xorDecrypt(buf, hexKey) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', version: '14.0',
+  status: 'ok', version: '14.1',
   sources: ['mangaplus', 'comick', 'mangadex', 'dynasty', 'anilist'],
   comickCacheSize: Object.keys(comickById).length,
   searchCacheSize: Object.values(searchCache).reduce((n, s) => n + Object.keys(s).length, 0),
-  endpoints: ['/', '/search', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta', '/debug-comick', '/debug-chapter']
+  endpoints: ['/', '/search', '/search-br', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta', '/debug-comick', '/debug-chapter']
 }));
 
-// ─── GET /search?q=...&source=... ────────────────────────────────────────────
+// ─── GET /search?q=...&source=...&lang=... ───────────────────────────────────
 app.get('/search', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-  const { q, source } = req.query;
+  const { q, source, lang } = req.query;
   if (!q) return res.status(400).json({ error: 'q obrigatório' });
-  console.log(`[SEARCH] "${q}" source="${source || 'auto'}"`);
+  console.log(`[SEARCH] "${q}" source="${source || 'auto'}" lang="${lang || 'any'}"`);
 
   if (source === 'comick') return res.json({ results: await comickSearch(q), source: 'comick' });
   if (source === 'anilist') return res.json({ results: await anilistSearch(q), source: 'anilist' });
-  if (source === 'mangadex') return res.json({ results: await mdxSearch(q), source: 'mangadex' });
+  if (source === 'mangadex') return res.json({ results: await mdxSearch(q, lang || null), source: 'mangadex' });
   if (source === 'dynasty') return res.json({ results: await dynastySearch(q), source: 'dynasty' });
 
   // Auto: MangaPlus → Comick → MangaDex → Dynasty
@@ -836,7 +886,7 @@ app.get('/search', async (req, res) => {
   } catch (e) { console.warn('[SEARCH] Comick erro:', e.message); }
 
   try {
-    const mdx = await mdxSearch(q);
+    const mdx = await mdxSearch(q, lang || null);
     if (mdx.length > 0) { console.log(`[SEARCH] MangaDex: ${mdx.length}`); return res.json({ results: mdx, source: 'mangadex' }); }
   } catch (e) { console.error('[SEARCH] MDX erro:', e.message); }
 
@@ -846,6 +896,29 @@ app.get('/search', async (req, res) => {
   } catch (e) { console.error('[SEARCH] Dynasty erro:', e.message); }
 
   res.json({ results: [], source: 'none' });
+});
+
+// ─── GET /search-br?q=... ─────────────────────────────────────────────────────
+// Busca APENAS no MangaDex filtrando por disponibilidade em PT-BR
+// Ideal para o Flutter mostrar um filtro "Disponível em Português"
+app.get('/search-br', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const { q } = req.query;
+  if (!q) return res.status(400).json({ error: 'q obrigatório' });
+  console.log(`[SEARCH-BR] "${q}"`);
+  try {
+    // Busca com filtro pt-br primeiro, fallback sem filtro marcando hasPtBr
+    let results = await mdxSearch(q, 'pt-br');
+    if (results.length === 0) {
+      results = await mdxSearch(q);
+      results = results.filter(r => r.hasPtBr);
+    }
+    console.log(`[SEARCH-BR] ${results.length} resultados PT-BR`);
+    return res.json({ results, source: 'mangadex', lang: 'pt-br' });
+  } catch (e) {
+    console.error('[SEARCH-BR] erro:', e.message);
+    res.json({ results: [], source: 'mangadex' });
+  }
 });
 
 // ─── GET /manga?id=...&source=...&url=... ─────────────────────────────────────
