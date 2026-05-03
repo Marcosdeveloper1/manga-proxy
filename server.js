@@ -4,33 +4,16 @@ const http = require('http');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-// ─── FlareSolverr (opcional) ──────────────────────────────────────────────────
-// Se tiver o FlareSolverr rodando em algum lugar, coloque a URL como
-// variável de ambiente FLARESOLVERR_URL no Railway.
-// Ex: https://flaresolverr-xxxxx.up.railway.app
-// Sem ele, usa fetch normal (pode não passar Cloudflare pesado).
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || null;
 
-async function fetchPage(targetUrl, referer) {
-  if (FLARESOLVERR_URL) {
-    try {
-      const payload = JSON.stringify({ cmd: 'request.get', url: targetUrl, maxTimeout: 60000 });
-      const result = await postJSON(FLARESOLVERR_URL + '/v1', payload);
-      if (result?.solution?.response) return result.solution.response;
-    } catch (e) {
-      console.warn('[FlareSolverr] erro, usando fetch direto:', e.message);
-    }
-  }
-  return fetchRaw(targetUrl, referer);
-}
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 function fetchRaw(url, referer) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const headers = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
     };
     if (referer) headers['Referer'] = referer;
@@ -39,8 +22,8 @@ function fetchRaw(url, referer) {
         return fetchRaw(res.headers.location, referer).then(resolve).catch(reject);
       }
       let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data));
+      res.on('data', c => data += c);
+      res.on('end', () => resolve({ html: data, status: res.statusCode }));
     }).on('error', reject);
   });
 }
@@ -65,6 +48,21 @@ function postJSON(url, body) {
   });
 }
 
+async function fetchWithFlare(url, referer) {
+  if (FLARESOLVERR_URL) {
+    try {
+      const payload = JSON.stringify({ cmd: 'request.get', url, maxTimeout: 60000 });
+      const result = await postJSON(FLARESOLVERR_URL + '/v1', payload);
+      if (result?.solution?.response) {
+        return { html: result.solution.response, status: result.solution.status };
+      }
+    } catch (e) {
+      console.warn('[Flare] erro:', e.message);
+    }
+  }
+  return fetchRaw(url, referer);
+}
+
 function fetchJSON(url) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
@@ -74,6 +72,17 @@ function fetchJSON(url) {
       res.on('end', () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } });
     }).on('error', reject);
   });
+}
+
+function isCloudflareBlock(html) {
+  return html.includes('cf-browser-verification') || 
+         html.includes('Just a moment') || 
+         html.includes('Checking your browser') ||
+         html.includes('cf_chl_');
+}
+
+function isUuid(str) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
@@ -89,32 +98,31 @@ app.get('/', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /search?q=naruto
-// Fonte 1: WeebCentral (sucessor MangaSee/MangaLife, catálogo enorme)
-// Fonte 2: MangaDex API (fallback sem Cloudflare)
+// GET /search?q=...
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'q obrigatório' });
   console.log(`[SEARCH] "${query}"`);
 
-  // Fonte 1: WeebCentral
+  // Fonte 1: WeebCentral via FlareSolverr
   try {
     const url = `https://weebcentral.com/search?query=${encodeURIComponent(query)}&type=series`;
-    const html = await fetchPage(url);
-    if (html.includes('cf-browser-verification') || html.includes('Just a moment')) {
-      throw new Error('Cloudflare block');
-    }
-    const results = parseWeebSearch(html);
-    if (results.length > 0) {
-      console.log(`[SEARCH] WeebCentral ok: ${results.length}`);
-      return res.json({ results, source: 'weebcentral' });
+    const { html } = await fetchWithFlare(url);
+    if (!isCloudflareBlock(html)) {
+      const results = parseWeebSearch(html);
+      if (results.length > 0) {
+        console.log(`[SEARCH] WeebCentral: ${results.length}`);
+        return res.json({ results, source: 'weebcentral' });
+      }
+    } else {
+      console.warn('[SEARCH] WeebCentral: Cloudflare block');
     }
   } catch (e) {
-    console.warn(`[SEARCH] WeebCentral falhou: ${e.message}`);
+    console.warn(`[SEARCH] WeebCentral erro: ${e.message}`);
   }
 
-  // Fonte 2: MangaDex
+  // Fonte 2: MangaDex API
   try {
     const url = `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`;
     const data = await fetchJSON(url);
@@ -128,174 +136,214 @@ app.get('/search', async (req, res) => {
           source: 'mangadex',
         };
       });
-      console.log(`[SEARCH] MangaDex ok: ${results.length}`);
+      console.log(`[SEARCH] MangaDex: ${results.length}`);
       return res.json({ results, source: 'mangadex' });
     }
   } catch (e) {
-    console.error(`[SEARCH] MangaDex falhou: ${e.message}`);
+    console.error(`[SEARCH] MangaDex erro: ${e.message}`);
   }
 
   res.json({ results: [], source: 'none' });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /manga?id=<id>&source=weebcentral|mangadex
+// GET /manga?id=...&source=...
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/manga', async (req, res) => {
   const { id, source } = req.query;
   if (!id) return res.status(400).json({ error: 'id obrigatório' });
   console.log(`[MANGA] id="${id}" source="${source}"`);
 
+  // WeebCentral
   if (!source || source === 'weebcentral') {
     try {
       const url = id.startsWith('http') ? id : `https://weebcentral.com/series/${id}`;
-      const html = await fetchPage(url);
-      if (!html.includes('cf-browser-verification') && !html.includes('Just a moment')) {
-        return res.json({ ...parseWeebManga(html, id), source: 'weebcentral' });
+      const { html } = await fetchWithFlare(url);
+      if (!isCloudflareBlock(html)) {
+        return res.json({ ...parseWeebManga(html), source: 'weebcentral' });
       }
     } catch (e) {
       console.error(`[MANGA] WeebCentral erro: ${e.message}`);
     }
   }
 
-  // MangaDex fallback
+  // MangaDex
   try {
     const detail = await fetchJSON(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`);
     const m = detail.data;
-    const title = m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
+    const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
     const cover = m.relationships.find(r => r.type === 'cover_art');
     const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
-    const chapData = await fetchJSON(`https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=en&order[chapter]=desc&limit=100`);
-    const chapters = (chapData.data || []).map(ch => ({
-      id: ch.id,
-      title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
-      chapterNumber: ch.attributes.chapter || '0',
-      source: 'mangadex',
-    }));
-    return res.json({ title, coverUrl, description: m.attributes.description?.en || '', chapters, source: 'mangadex' });
+
+    // Busca capítulos em PT-BR e EN
+    let chapters = [];
+    for (const lang of ['pt-br', 'en']) {
+      try {
+        const chapData = await fetchJSON(
+          `https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`
+        );
+        if (chapData.data?.length > 0) {
+          chapters = chapData.data.map(ch => ({
+            id: ch.id,
+            title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
+            chapterNumber: ch.attributes.chapter || '0',
+            lang,
+            source: 'mangadex',
+          }));
+          break;
+        }
+      } catch (_) {}
+    }
+
+    return res.json({ title, coverUrl, description: m.attributes.description?.en || m.attributes.description?.['pt-br'] || '', chapters, source: 'mangadex' });
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /chapter?id=<id>&source=weebcentral|mangadex
-// GET /chapter?url=<url_completa>
+// GET /chapter?id=...&source=...&url=...
+// Para One Piece e títulos sem páginas no MangaDex:
+//   usa WeebCentral via FlareSolverr buscando pelo título
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/chapter', async (req, res) => {
-  const { id, url: chUrl, source } = req.query;
-  console.log(`[CHAPTER] id="${id}" source="${source}"`);
+  const { id, url: chUrl, source, title, chapterNumber } = req.query;
+  console.log(`[CHAPTER] id="${id}" source="${source}" title="${title}" ch="${chapterNumber}"`);
 
-  // WeebCentral: tem endpoint JSON nativo para imagens!
-  if (id && (!source || source === 'weebcentral')) {
+  // 1. MangaDex direto (funciona para a maioria dos títulos)
+  if (id && (source === 'mangadex' || isUuid(id))) {
     try {
-      // Endpoint oficial do WeebCentral para imagens do capítulo
-      const imgUrl = `https://weebcentral.com/chapters/${id}/images?is_prev=False&current_page=1&reading_style=long_strip`;
-      const html = await fetchPage(imgUrl, `https://weebcentral.com/chapters/${id}`);
-      const pages = parseWeebPages(html);
+      const data = await fetchJSON(`https://api.mangadex.org/at-home/server/${id}`);
+      const base = data.baseUrl, hash = data.chapter?.hash;
+      const pages = (data.chapter?.data || []).map(f => `${base}/data/${hash}/${f}`);
       if (pages.length > 0) {
-        console.log(`[CHAPTER] WeebCentral: ${pages.length} páginas`);
-        return res.json({ pages, source: 'weebcentral' });
+        console.log(`[CHAPTER] MangaDex: ${pages.length} páginas`);
+        return res.json({ pages, source: 'mangadex' });
+      }
+      console.warn('[CHAPTER] MangaDex: 0 páginas (DMCA), tentando WeebCentral');
+    } catch (e) {
+      console.warn(`[CHAPTER] MangaDex erro: ${e.message}`);
+    }
+  }
+
+  // 2. WeebCentral via FlareSolverr
+  //    Precisa do título do mangá e número do capítulo para achar no WeebCentral
+  if (title && chapterNumber) {
+    try {
+      // Busca o mangá no WeebCentral
+      const searchUrl = `https://weebcentral.com/search?query=${encodeURIComponent(title)}&type=series`;
+      const { html: searchHtml } = await fetchWithFlare(searchUrl);
+
+      if (!isCloudflareBlock(searchHtml)) {
+        const results = parseWeebSearch(searchHtml);
+        if (results.length > 0) {
+          const seriesId = results[0].id;
+          // Abre a página da série
+          const seriesUrl = `https://weebcentral.com/series/${seriesId}`;
+          const { html: seriesHtml } = await fetchWithFlare(seriesUrl);
+
+          if (!isCloudflareBlock(seriesHtml)) {
+            const manga = parseWeebManga(seriesHtml);
+            // Acha o capítulo pelo número
+            const chapter = manga.chapters.find(c =>
+              parseFloat(c.chapterNumber) === parseFloat(chapterNumber)
+            ) || manga.chapters[0];
+
+            if (chapter) {
+              // Pega as páginas do capítulo
+              const imgUrl = `https://weebcentral.com/chapters/${chapter.id}/images?is_prev=False&current_page=1&reading_style=long_strip`;
+              const { html: imgHtml } = await fetchWithFlare(imgUrl, seriesUrl);
+              const pages = parseWeebPages(imgHtml);
+              if (pages.length > 0) {
+                console.log(`[CHAPTER] WeebCentral: ${pages.length} páginas`);
+                return res.json({ pages, source: 'weebcentral' });
+              }
+            }
+          }
+        }
       }
     } catch (e) {
       console.error(`[CHAPTER] WeebCentral erro: ${e.message}`);
     }
   }
 
-  // URL direta (qualquer fonte)
+  // 3. URL direta
   if (chUrl) {
     try {
-      const html = await fetchPage(chUrl);
+      const { html } = await fetchWithFlare(chUrl);
       const pages = parseWeebPages(html);
-      return res.json({ pages, source: 'url' });
+      if (pages.length > 0) return res.json({ pages, source: 'url' });
     } catch (e) {
       console.error(`[CHAPTER] URL erro: ${e.message}`);
     }
   }
 
-  // MangaDex
-  if (id && (source === 'mangadex' || isUuid(id))) {
-    try {
-      const data = await fetchJSON(`https://api.mangadex.org/at-home/server/${id}`);
-      const base = data.baseUrl, hash = data.chapter?.hash;
-      const pages = (data.chapter?.data || []).map(f => `${base}/data/${hash}/${f}`);
-      return res.json({ pages, source: 'mangadex' });
-    } catch (e) {
-      return res.status(500).json({ error: e.message });
-    }
-  }
-
-  res.status(400).json({ error: 'Forneça id ou url' });
+  res.json({ pages: [], source: 'none', error: 'Nenhuma fonte retornou páginas. Tente passar title= e chapterNumber= na requisição.' });
 });
 
-// ─── Parsers ──────────────────────────────────────────────────────────────────
+// ─── Parsers WeebCentral ──────────────────────────────────────────────────────
 
 function parseWeebSearch(html) {
   const results = [];
-  // WeebCentral usa links /series/<ULID>
-  const re = /href="https:\/\/weebcentral\.com\/series\/([^"\/\?]+)"[^>]*>([\s\S]*?)(?=href="|<\/section|<\/ul)/g;
+  const re = /href="https:\/\/weebcentral\.com\/series\/([A-Z0-9]{26})"[^>]*>([\s\S]*?)(?=href="|<\/(?:li|section|ul))/g;
   let m;
   while ((m = re.exec(html)) !== null) {
     const id = m[1];
     const block = m[2];
-    if (!id || id.length < 10) continue; // ULID tem ~26 chars
     const titleM = block.match(/<strong[^>]*>([^<]+)<\/strong>/) || block.match(/alt="([^"]{3,80})"/);
     const imgM = block.match(/src="(https:\/\/[^"]+\.(?:jpg|png|webp)[^"]*)"/);
     if (titleM) {
       results.push({
-        id,
-        title: titleM[1].trim(),
+        id, title: titleM[1].trim(),
         coverUrl: imgM ? imgM[1] : null,
         url: `https://weebcentral.com/series/${id}`,
         source: 'weebcentral',
       });
     }
   }
-  return [...new Map(results.map(r => [r.id, r])).values()]; // deduplica
+  return [...new Map(results.map(r => [r.id, r])).values()];
 }
 
-function parseWeebManga(html, seriesId) {
+function parseWeebManga(html) {
   const title = (html.match(/<h1[^>]*>([^<]+)<\/h1>/) || [])[1]?.trim() || '';
-  const cover = (html.match(/class="[^"]*lazy[^"]*"[^>]*src="([^"]+)"/) ||
-                 html.match(/<img[^>]*src="(https:\/\/[^"]*cover[^"]+)"/i) || [])[1] || null;
+  const coverM = html.match(/class="[^"]*lazy[^"]*"[^>]*src="([^"]+)"/) ||
+                 html.match(/<img[^>]*src="(https:\/\/[^"]*(?:cover|thumb)[^"]+)"/i);
+  const coverUrl = coverM ? coverM[1] : null;
   const descM = html.match(/class="[^"]*description[^"]*"[^>]*>([\s\S]*?)<\/(?:p|div)>/);
   const description = descM ? descM[1].replace(/<[^>]+>/g, '').trim() : '';
 
   const chapters = [];
-  const re = /href="https:\/\/weebcentral\.com\/chapters\/([^"\/\?]+)"[^>]*>([\s\S]*?)(?=href="|<\/li|<\/section)/g;
+  const re = /href="https:\/\/weebcentral\.com\/chapters\/([A-Z0-9]{26})"[^>]*>([\s\S]*?)(?=href="|<\/(?:li|section))/g;
   let m;
   while ((m = re.exec(html)) !== null) {
     const chapId = m[1];
     const block = m[2];
     const numM = block.match(/Chapter\s+(\d+\.?\d*)/i) || block.match(/(\d+\.?\d*)/);
-    const chapterNumber = numM ? numM[1] : '0';
-    if (chapId && chapId.length > 5 && !chapId.includes('?')) {
-      chapters.push({ id: chapId, title: `Capítulo ${chapterNumber}`, chapterNumber, source: 'weebcentral' });
+    if (chapId) {
+      chapters.push({
+        id: chapId,
+        title: `Capítulo ${numM ? numM[1] : '?'}`,
+        chapterNumber: numM ? numM[1] : '0',
+        source: 'weebcentral',
+      });
     }
   }
-  return { title, coverUrl: cover, description, chapters };
+  return { title, coverUrl, description, chapters };
 }
 
 function parseWeebPages(html) {
   const pages = [];
-  // Imagens do leitor
   const re = /<img[^>]*src="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const url = m[1];
-    // Filtra ícones/logos (geralmente pequenos, com "icon", "logo", "avatar")
-    if (!url.includes('icon') && !url.includes('logo') && !url.includes('avatar')) {
-      pages.push(url);
+    const u = m[1];
+    if (!u.includes('icon') && !u.includes('logo') && !u.includes('avatar') && !u.includes('favicon')) {
+      pages.push(u);
     }
   }
-  // data-src (lazy loading)
   const re2 = /data-src="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi;
   while ((m = re2.exec(html)) !== null) pages.push(m[1]);
   return [...new Set(pages)];
-}
-
-function isUuid(str) {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str);
 }
 
 // ─── Start ────────────────────────────────────────────────────────────────────
