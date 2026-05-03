@@ -123,7 +123,12 @@ function getSuccess(raw) {
 }
 
 async function mpSearch(query) {
-  const raw = await mpRaw('/title_list/allV3?language=0');
+  // API mobile tem catálogo completo, web API (jumpg-webapi) rejeita allV3
+  const { buffer: raw, status } = await fetchRaw(
+    'https://jumpg-api.tokyo-cdn.com/api/title_list/allV2',
+    mpHeaders()
+  );
+  if (status !== 200) throw new Error('HTTP ' + status);
   const success = getSuccess(raw);
   const atv = success[4]?.[0];
   if (!atv) throw new Error('allTitlesView(4) não encontrado. Fields: ' + Object.keys(success).join(','));
