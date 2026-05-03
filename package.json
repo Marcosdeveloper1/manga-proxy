@@ -1,13 +1,14 @@
 {
   "name": "manga-proxy",
-  "version": "4.0.0",
-  "description": "Proxy MangaPlus + MangaDex — sem Puppeteer",
+  "version": "5.0.0",
+  "description": "Proxy MangaPlus (Protobuf) + MangaDex",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "protobufjs": "^7.3.0"
   },
   "engines": {
     "node": ">=18.0.0"
