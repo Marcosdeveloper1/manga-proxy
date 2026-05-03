@@ -314,13 +314,46 @@ async function comickGetManga(mangaId) {
 
 async function comickGetPages(chapterHid) {
   try {
-    const url = chapterHid.includes('http') ? Buffer.from(chapterHid, 'base64').toString('utf8') : chapterHid;
-    const response = await fetchPOST(`${COMICK_BASE}/pages`, { url });
-    const data = JSON.parse(response.buffer.toString('utf8'));
-    return data.pages || [];
-  } catch (e) { return []; }
+    console.log(`[COMICK] getPages: "${chapterHid.substring(0, 50)}..."`);
+    
+    // 1. SEMPRE decodifica base64 → URL real
+    let chapterUrl;
+    try {
+      chapterUrl = Buffer.from(chapterHid, 'base64').toString('utf8');
+      console.log(`[COMICK] URL: ${chapterUrl}`);
+    } catch {
+      chapterUrl = chapterHid; // fallback
+    }
+    
+    // 2. Usa endpoint CORRETO: /pages
+    const pagesResp = await fetchPOST(
+      `${COMICK_BASE}/pages`,
+      { url: chapterUrl },
+      { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+    );
+    
+    // 3. Parse do STREAM (igual search/manga)
+    const pagesText = pagesResp.buffer.toString('utf8');
+    const pagesObjects = pagesText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+    
+    let pages = [];
+    for (const jsonStr of pagesObjects) {
+      try {
+        const obj = JSON.parse(jsonStr);
+        if (obj.pages && Array.isArray(obj.pages)) {
+          pages = obj.pages.map(p => p.url || p.src).filter(Boolean);
+          console.log(`[COMICK] ${pages.length} páginas OK`);
+          break;
+        }
+      } catch {}
+    }
+    
+    return pages;
+  } catch (e) {
+    console.error('[COMICK] getPages erro:', e.message);
+    return [];
+  }
 }
-
 // ══════════════════════════════════════════════════════════════════════════════
 //  ANILIST / MANGADEX / ROTAS (Mantidos conforme lógica original)
 // ══════════════════════════════════════════════════════════════════════════════
