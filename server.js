@@ -371,6 +371,25 @@ app.get('/chapter', async (req, res) => {
   res.json({ pages: [], source: 'none', error: 'Nenhuma fonte retornou páginas.' });
 });
 
+app.get('/debug-api', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { buffer, status } = await fetchRaw(
+      'https://jumpg-api.tokyo-cdn.com/api/title_list/allV2',
+      mpHeaders()
+    );
+    const resp = readPB(buffer);
+    const successBuf = resp[1]?.[0];
+    res.json({
+      status,
+      size: buffer.length,
+      hasSuccess: !!successBuf,
+      topFields: Object.keys(resp).join(','),
+      hex30: buffer.slice(0,30).toString('hex'),
+    });
+  } catch(e) { res.json({ error: e.message }); }
+});
+
 // ─── GET /image-proxy?url=...&key=... ─────────────────────────────────────────
 app.get('/image-proxy', async (req, res) => {
   const { url, key } = req.query;
