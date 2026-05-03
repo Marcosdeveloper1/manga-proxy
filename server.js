@@ -282,6 +282,15 @@ async function comickSearch(query) {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
+      // Na comickSearch, linha do map:
+return results.slice(0, 20).map(item => ({
+  id: item.id,
+  title: item.title,
+  coverUrl: item.coverImage,
+  url: item.url,  // ← ADICIONA isso
+  latestChapter: item.latestChapter,
+  source: 'comick'
+}));
     );
     
     const text = response.buffer.toString('utf8');
@@ -332,21 +341,18 @@ async function comickGetManga(mangaId) {
     let title = mangaId;
     
     // Procura resultado com ID exato OU título similar
-    for (const jsonStr of searchObjects) {
-      try {
-        const obj = JSON.parse(jsonStr);
-        if (obj.results && obj.results[0]) {
-          const result = obj.results[0];
-          // Se ID bate OU título contém o ID
-          if (result.id === mangaId || result.title.toLowerCase().includes(mangaId.toLowerCase())) {
-            mangaUrl = result.url;
-            title = result.title;
-            console.log(`[COMICK] Match exato: ${title} -> ${mangaUrl}`);
-            break;
-          }
-        }
-      } catch {}
+    // SIMPLIFICA: pega SEMPRE o primeiro resultado
+for (const jsonStr of searchObjects) {
+  try {
+    const obj = JSON.parse(jsonStr);
+    if (obj.results && obj.results[0]) {
+      mangaUrl = obj.results[0].url;
+      title = obj.results[0].title;
+      console.log(`[COMICK] Usando primeiro: ${title} -> ${mangaUrl}`);
+      break;
     }
+  } catch {}
+}
     
     if (!mangaUrl) {
       console.log('[COMICK] Nenhum match exato');
