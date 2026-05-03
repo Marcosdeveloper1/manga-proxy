@@ -1,11 +1,10 @@
 {
   "name": "manga-proxy",
-  "version": "5.1.0",
+  "version": "6.0.0",
   "main": "server.js",
   "scripts": { "start": "node server.js" },
   "dependencies": {
-    "express": "^4.18.2",
-    "protobufjs": "^7.3.0"
+    "express": "^4.18.2"
   },
   "engines": { "node": ">=18.0.0" }
 }
