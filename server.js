@@ -1,13 +1,12 @@
 const express = require('express');
 const https = require('https');
 const http = require('http');
-const { randomUUID } = require('crypto'); // nativo do Node 18+
+const { randomUUID } = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── HTTP helpers ──────────────────────────────────────────────────────────────
-
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
 function fetchRaw(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
@@ -31,23 +30,20 @@ function isUuid(s) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 }
 
-// ─── CORS ──────────────────────────────────────────────────────────────────────
+// ─── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PROTOBUF READER MANUAL
 // ══════════════════════════════════════════════════════════════════════════════
-
 function readPB(buf) {
   const fields = {};
   let pos = 0;
-
   function varint() {
     let v = 0, shift = 0, b;
     do { b = buf[pos++]; v |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
     return v;
   }
-
   while (pos < buf.length) {
     try {
       const tag = varint();
@@ -68,11 +64,10 @@ function readPB(buf) {
 const s = b => Buffer.from(b).toString('utf8');
 const pb = b => Buffer.from(b);
 
-// ─── MangaPlus config ──────────────────────────────────────────────────────────
-const MP = 'https://jumpg-webapi.tokyo-cdn.com/api';
+// ─── MangaPlus ────────────────────────────────────────────────────────────────
+const MP_WEB = 'https://jumpg-webapi.tokyo-cdn.com/api';
+const MP_APP = 'https://jumpg-api.tokyo-cdn.com/api';
 
-// ⚠️  SESSION-TOKEN é OBRIGATÓRIO — sem ele a API retorna buffer de erro (~1353b)
-// Gerado novo a cada requisição com randomUUID() nativo do Node 18
 function mpHeaders() {
   return {
     'Origin': 'https://mangaplus.shueisha.co.jp',
@@ -85,10 +80,25 @@ function mpHeaders() {
   };
 }
 
+// Usa a web API (jumpg-webapi) — funciona para title_detail e manga_viewer
 async function mpRaw(path) {
-  const { buffer, status } = await fetchRaw(`${MP}${path}`, mpHeaders());
+  const { buffer, status } = await fetchRaw(`${MP_WEB}${path}`, mpHeaders());
   if (status !== 200) throw new Error(`HTTP ${status} para ${path}`);
   return buffer;
+}
+
+// Usa a app API (jumpg-api) — necessária para title_list/allV3
+async function mpAppRaw(path) {
+  const { buffer, status } = await fetchRaw(`${MP_APP}${path}`, mpHeaders());
+  if (status !== 200) throw new Error(`HTTP ${status} para ${path}`);
+  return buffer;
+}
+
+function getSuccess(raw) {
+  const resp = readPB(raw);
+  const successBuf = resp[1]?.[0];
+  if (!successBuf) throw new Error('Campo success(1) não encontrado. Tamanho buffer: ' + raw.length);
+  return readPB(pb(successBuf));
 }
 
 function decodeTitle(b) {
@@ -118,29 +128,89 @@ function decodePage(b) {
   };
 }
 
-function getSuccess(raw) {
-  const resp = readPB(raw);
-  const successBuf = resp[1]?.[0];
-  if (!successBuf) throw new Error('Campo success(1) não encontrado. Tamanho buffer: ' + raw.length);
-  return readPB(pb(successBuf));
-}
-
 async function mpSearch(query) {
-  // API mobile tem catálogo completo, web API (jumpg-webapi) rejeita allV3
-  const { buffer: raw, status } = await fetchRaw(
-    'https://jumpg-api.tokyo-cdn.com/api/title_list/allV2',
-    mpHeaders()
-  );
-  if (status !== 200) throw new Error('HTTP ' + status);
-  const success = getSuccess(raw);
-  const atv = success[4]?.[0];
-  if (!atv) throw new Error('allTitlesView(4) não encontrado. Fields: ' + Object.keys(success).join(','));
-  const titles = readPB(pb(atv))[1] || [];
+  // ── Tenta allV3 na app API com title_type=0 (todos os títulos) ──────────────
+  // O parâmetro correto é title_type, NÃO language
+  const endpoints = [
+    '/title_list/allV3?title_type=0',
+    '/title_list/allV3?title_type=1',  // serializando
+    '/title_list/allV3',               // sem parâmetro
+    '/title_list/allV2',               // fallback v2
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      console.log(`[SEARCH MP] Tentando: ${ep}`);
+      const raw = await mpAppRaw(ep);
+      const success = getSuccess(raw);
+
+      // allV3 usa campo 4 (AllTitlesViewV3), allV2 usa campo 4 também
+      const atv = success[4]?.[0];
+      if (!atv) {
+        console.log(`[SEARCH MP] ${ep}: sem campo 4. Fields: ${Object.keys(success).join(',')}`);
+        continue;
+      }
+
+      const parsed = readPB(pb(atv));
+      // Títulos ficam no campo 1
+      const titles = parsed[1] || [];
+      if (titles.length === 0) {
+        console.log(`[SEARCH MP] ${ep}: campo 4 vazio`);
+        continue;
+      }
+
+      const q = query.toLowerCase();
+      const results = titles.map(decodeTitle)
+        .filter(t => t.name?.toLowerCase().includes(q))
+        .slice(0, 20)
+        .map(t => ({
+          id: String(t.titleId),
+          title: t.name,
+          coverUrl: t.portraitImageUrl || null,
+          source: 'mangaplus',
+        }));
+
+      console.log(`[SEARCH MP] ${ep}: ${titles.length} títulos total, ${results.length} matches para "${query}"`);
+      if (results.length > 0) return results;
+
+    } catch (e) {
+      console.warn(`[SEARCH MP] ${ep} erro: ${e.message}`);
+    }
+  }
+
+  // ── Fallback: title_detail de IDs conhecidos ──────────────────────────────
+  // Se o allV3 falhar, tenta buscar pelos IDs fixos dos títulos mais populares
+  const POPULAR_IDS = {
+    'one piece': 700005,
+    'naruto': 100102,
+    'boruto': 100186,
+    'demon slayer': 100197,
+    'jujutsu kaisen': 100136,
+    'chainsaw man': 100191,
+    'dandadan': 100268,
+    'dan da dan': 100268,
+    'blue lock': 100227,
+    'my hero academia': 100103,
+    'black clover': 100109,
+    'dragon ball': 100010,
+  };
+
   const q = query.toLowerCase();
-  return titles.map(decodeTitle)
-    .filter(t => t.name?.toLowerCase().includes(q))
-    .slice(0, 20)
-    .map(t => ({ id: String(t.titleId), title: t.name, coverUrl: t.portraitImageUrl || null, source: 'mangaplus' }));
+  for (const [key, id] of Object.entries(POPULAR_IDS)) {
+    if (key.includes(q) || q.includes(key.split(' ')[0])) {
+      console.log(`[SEARCH MP] Fallback ID fixo: ${key} → ${id}`);
+      try {
+        const detail = await mpGetTitle(id);
+        if (detail.title) {
+          return [{ id: String(id), title: detail.title, coverUrl: detail.coverUrl, source: 'mangaplus' }];
+        }
+      } catch (e) {
+        console.warn(`[SEARCH MP] ID fixo ${id} erro: ${e.message}`);
+      }
+    }
+  }
+
+  return [];
 }
 
 async function mpGetTitle(titleId) {
@@ -149,9 +219,7 @@ async function mpGetTitle(titleId) {
   const tdv = success[8]?.[0];
   if (!tdv) throw new Error('titleDetailView(8) não encontrado. Fields: ' + Object.keys(success).join(','));
   const detail = readPB(pb(tdv));
-
   const titleInfo = detail[1]?.[0] ? decodeTitle(detail[1][0]) : {};
-
   const chapters = [];
   const seen = new Set();
   for (const groupBuf of (detail[28] || [])) {
@@ -163,13 +231,12 @@ async function mpGetTitle(titleId) {
       seen.add(c.chapterId);
       chapters.push({
         id: String(c.chapterId),
-        title: c.subTitle || `Capitulo ${c.name}`,
+        title: c.subTitle || `Capítulo ${c.name}`,
         chapterNumber: c.name || String(c.chapterId),
         source: 'mangaplus',
       });
     }
   }
-
   return {
     title: titleInfo.name || '',
     coverUrl: titleInfo.portraitImageUrl || null,
@@ -200,72 +267,7 @@ function xorDecrypt(buf, hexKey) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '7.0-session-token' }));
-
-// ─── DEBUG — estrutura da resposta ────────────────────────────────────────────
-app.get('/debug', async (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  const titleId = req.query.id || '700005';
-  const endpoint = req.query.ep || `/title_detail_v3?title_id=${titleId}&language=0`;
-  try {
-    const raw = await mpRaw(endpoint);
-    const resp = readPB(raw);
-    const successBuf = resp[1]?.[0];
-    if (!successBuf) return res.json({ error: 'sem success', size: raw.length, hex: raw.slice(0,40).toString('hex') });
-    const success = readPB(pb(successBuf));
-    const tdvBuf = success[8]?.[0];
-    if (!tdvBuf) return res.json({ error: 'sem titleDetailView', successFields: Object.keys(success).join(',') });
-    const tdv = readPB(pb(tdvBuf));
-    const fieldInfo = {};
-    for (const [fn, vals] of Object.entries(tdv)) {
-      fieldInfo[fn] = vals.map(v => {
-        if (typeof v === 'number') return { type: 'varint', value: v };
-        const str = Buffer.from(v).toString('utf8');
-        if (/^[\x20-\x7E\u00C0-\uFFFF]*$/.test(str) && str.length < 200) return { type: 'string', value: str };
-        try {
-          const sub = readPB(Buffer.from(v));
-          const subInfo = {};
-          for (const [sf, svs] of Object.entries(sub)) {
-            subInfo[sf] = svs.map(sv => {
-              if (typeof sv === 'number') return sv;
-              const ss = Buffer.from(sv).toString('utf8');
-              return /^[\x20-\x7E\u00C0-\uFFFF]*$/.test(ss) ? ss.slice(0,80) : `<bytes ${sv.length}>`;
-            });
-          }
-          return { type: 'message', fields: subInfo };
-        } catch { return { type: 'bytes', length: v.length }; }
-      });
-    }
-    res.json({ endpoint, size: raw.length, titleDetailViewFields: fieldInfo });
-  } catch (e) { res.json({ error: e.message }); }
-});
-
-// ─── DEBUG2 — estrutura do manga_viewer ──────────────────────────────────────
-app.get('/debug2', async (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  const chapterId = req.query.id || '7000036';
-  try {
-    const raw = await mpRaw(`/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`);
-    const resp = readPB(raw);
-    const successBuf = resp[1]?.[0];
-    if (!successBuf) return res.json({ error: 'sem success', size: raw.length });
-    const success = readPB(pb(successBuf));
-    const viewerBuf = success[10]?.[0];
-    if (!viewerBuf) return res.json({ error: 'sem mangaViewer', successFields: Object.keys(success).join(',') });
-    const viewer = readPB(pb(viewerBuf));
-    const pageCount = (viewer[1] || []).length;
-    let firstImageUrl = null, firstKey = null;
-    if (viewer[1]?.[0]) {
-      const page = readPB(pb(viewer[1][0]));
-      const mp = page[1]?.[0] ? readPB(pb(page[1][0])) : null;
-      if (mp) {
-        firstImageUrl = mp[1]?.[0] ? s(mp[1][0]) : null;
-        firstKey = mp[5]?.[0] ? s(mp[5][0]) : null;
-      }
-    }
-    res.json({ chapterId, size: raw.length, pageCount, firstImageUrl, firstKey });
-  } catch (e) { res.json({ error: e.message }); }
-});
+app.get('/', (req, res) => res.json({ status: 'ok', version: '8.0-allV3-fix' }));
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -277,7 +279,7 @@ app.get('/search', async (req, res) => {
   try {
     const results = await mpSearch(q);
     if (results.length > 0) {
-      console.log(`[SEARCH] MangaPlus: ${results.length}`);
+      console.log(`[SEARCH] MangaPlus: ${results.length} resultados`);
       return res.json({ results, source: 'mangaplus' });
     }
     console.log('[SEARCH] MangaPlus: 0 resultados, tentando MangaDex');
@@ -374,25 +376,6 @@ app.get('/chapter', async (req, res) => {
   res.json({ pages: [], source: 'none', error: 'Nenhuma fonte retornou páginas.' });
 });
 
-app.get('/debug-api', async (req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  try {
-    const { buffer, status } = await fetchRaw(
-      'https://jumpg-api.tokyo-cdn.com/api/title_list/allV2',
-      mpHeaders()
-    );
-    const resp = readPB(buffer);
-    const successBuf = resp[1]?.[0];
-    res.json({
-      status,
-      size: buffer.length,
-      hasSuccess: !!successBuf,
-      topFields: Object.keys(resp).join(','),
-      hex30: buffer.slice(0,30).toString('hex'),
-    });
-  } catch(e) { res.json({ error: e.message }); }
-});
-
 // ─── GET /image-proxy?url=...&key=... ─────────────────────────────────────────
 app.get('/image-proxy', async (req, res) => {
   const { url, key } = req.query;
@@ -410,4 +393,27 @@ app.get('/image-proxy', async (req, res) => {
   } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
-app.listen(PORT, () => console.log(`Manga Proxy v7.0 (SESSION-TOKEN fix) na porta ${PORT}`));
+// ─── DEBUG ────────────────────────────────────────────────────────────────────
+app.get('/debug-allv3', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const results = {};
+  const eps = [
+    '/title_list/allV3?title_type=0',
+    '/title_list/allV3?title_type=1',
+    '/title_list/allV3',
+    '/title_list/allV2',
+  ];
+  for (const ep of eps) {
+    try {
+      const raw = await mpAppRaw(ep);
+      const resp = readPB(raw);
+      const successBuf = resp[1]?.[0];
+      results[ep] = { size: raw.length, hasSuccess: !!successBuf, hex10: raw.slice(0,10).toString('hex') };
+    } catch (e) {
+      results[ep] = { error: e.message };
+    }
+  }
+  res.json(results);
+});
+
+app.listen(PORT, () => console.log(`Manga Proxy v8.0 na porta ${PORT}`));
