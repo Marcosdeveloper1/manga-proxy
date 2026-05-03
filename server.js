@@ -35,15 +35,12 @@ function fetchPOST(url, body, headers = {}) {
     const urlObj = new URL(url);
     const options = {
       hostname: urlObj.hostname,
-      path: urlObj.pathname,
+      path: urlObj.pathname + (urlObj.search || ''),
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(data),
-        'X-Requested-With': 'XMLHttpRequest',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://mangalivre.net/',
-        'Origin': 'https://mangalivre.net',
         ...headers,
       },
     };
@@ -156,8 +153,6 @@ function decodePage(b) {
 }
 
 // ─── IDs verificados direto nas URLs do mangaplus.shueisha.co.jp ───────────────
-// Para adicionar novos: abra o título em mangaplus.shueisha.co.jp/titles/XXXXXX
-// e copie o número XXXXXX aqui embaixo.
 const MANGA_IDS = {
   // ── Em serialização ──────────────────────────────────────────────────────
   'one piece':               700005,
@@ -168,7 +163,6 @@ const MANGA_IDS = {
   'jujutsu kaisen':          100136,
   'chainsaw man':            100191,
   'my hero academia':        100103,
-  'black clover':            100109,
   'blue lock':               100227,
   'spy x family':            100249,
   'sakamoto days':           100235,
@@ -179,12 +173,12 @@ const MANGA_IDS = {
   'undead unluck':           100143,
   'witch watch':             100211,
   'akane-banashi':           100185,
-  // ── Clássicos (IDs verificados) ───────────────────────────────────────────
-  'naruto':                  100018,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100018
-  'dragon ball':             200010,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/200010
-  'dragon ball super':       100012,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100012
-  'bleach':                  100004,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100004
-  'death note':              100008,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100008
+  // ── Clássicos ─────────────────────────────────────────────────────────────
+  'naruto':                  100018,
+  'dragon ball':             200010,
+  'dragon ball super':       100012,
+  'bleach':                  100004,
+  'death note':              100008,
   'demon slayer':            100197,
   'kimetsu no yaiba':        100197,
   'fullmetal alchemist':     100031,
@@ -194,11 +188,9 @@ const MANGA_IDS = {
   'tokyo ghoul':             100095,
   'soul eater':              100042,
   'bakuman':                 100020,
-  'black clover':             100003,
+  'black clover':            100003,
   'world trigger':           100079,
-  'boruto naruto next generations': 100006,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100006
-  // ── Adicione novos abaixo ─────────────────────────────────────────────────
-  // 'nome em minúsculo': ID_NUMERICO,
+  'boruto naruto next generations': 100006,
 };
 
 async function mpGetTitle(titleId) {
@@ -247,14 +239,12 @@ async function mpGetPages(chapterId) {
 
 async function mpSearch(query) {
   const q = query.toLowerCase().trim();
-  // Busca exata
   if (MANGA_IDS[q]) {
     try {
       const detail = await mpGetTitle(MANGA_IDS[q]);
       if (detail.title) return [{ id: String(MANGA_IDS[q]), title: detail.title, coverUrl: detail.coverUrl, source: 'mangaplus' }];
     } catch (e) { console.warn('[MP] exato erro:', e.message); }
   }
-  // Busca parcial — tenta todos os que contêm o query
   const matches = Object.entries(MANGA_IDS).filter(([key]) =>
     key.includes(q) || q.includes(key) || key.split(' ').some(w => w.length > 3 && q.includes(w))
   );
@@ -270,70 +260,220 @@ async function mpSearch(query) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  MANGÁ LIVRE
+//  COMICK  (comick.io — API pública, catálogo enorme, PT-BR parcial)
+//  Docs: https://api.comick.io
 // ══════════════════════════════════════════════════════════════════════════════
 
-const ML_HEADERS = {
-  'X-Requested-With': 'XMLHttpRequest',
+const COMICK_BASE = 'https://api.comick.io';
+const COMICK_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  'Referer': 'https://mangalivre.net/',
   'Accept': 'application/json',
+  'Referer': 'https://comick.io/',
 };
 
-async function mlSearch(query) {
+async function comickSearch(query) {
   try {
-    const { buffer, status } = await fetchPOST(
-      'https://mangalivre.net/api/search',
-      { search: query },
+    const data = await fetchJSON(
+      `${COMICK_BASE}/v1.0/search?q=${encodeURIComponent(query)}&limit=10&page=1`,
+      COMICK_HEADERS
     );
-    if (status !== 200) { console.warn('[ML] search HTTP', status); return []; }
-    const data = JSON.parse(buffer.toString());
-    const series = data.series || data.data || [];
-    if (!Array.isArray(series) || series.length === 0) return [];
-    return series.slice(0, 10).map(s => ({
-      id: String(s.id_series || s.id || ''),
-      title: s.name || s.title || '',
-      coverUrl: s.cover || s.image || null,
-      source: 'mangalivre',
-    })).filter(r => r.id && r.title);
-  } catch (e) { console.warn('[ML] search erro:', e.message); return []; }
-}
-
-async function mlGetManga(seriesId) {
-  try {
-    const { buffer, status } = await fetchRaw(`https://mangalivre.net/api/chapters/${seriesId}`, ML_HEADERS);
-    if (status !== 200) throw new Error('HTTP ' + status);
-    const data = JSON.parse(buffer.toString());
-    const chapters = (data.chapters || []).map(c => ({
-      id: String(c.id_release || c.releases?.[Object.keys(c.releases)[0]]?.id_release || c.id || ''),
-      title: c.chapter_name || `Capítulo ${c.number}`,
-      chapterNumber: String(c.number || '0'),
-      source: 'mangalivre',
-    })).filter(c => c.id);
-    return {
-      title: data.name || '',
-      coverUrl: data.cover || null,
-      description: data.description || '',
-      chapters,
-      source: 'mangalivre',
-    };
+    if (!Array.isArray(data) || data.length === 0) return [];
+    return data.map(m => {
+      const cover = m.md_covers?.[0];
+      const coverUrl = cover
+        ? `https://meo.comick.pictures/${cover.b2key}`
+        : null;
+      return {
+        id: m.hid || m.slug,
+        title: m.title || m.slug || '',
+        coverUrl,
+        slug: m.slug,
+        source: 'comick',
+      };
+    }).filter(r => r.id && r.title);
   } catch (e) {
-    console.error('[ML] getManga erro:', e.message);
-    return { title: '', description: '', chapters: [], source: 'mangalivre' };
-  }
-}
-
-async function mlGetPages(releaseId) {
-  try {
-    const { buffer, status } = await fetchRaw(`https://mangalivre.net/api/pages/${releaseId}`, ML_HEADERS);
-    if (status !== 200) throw new Error('HTTP ' + status);
-    const data = JSON.parse(buffer.toString());
-    const images = data.images || data.pages || [];
-    return images.map(p => p.legacy || p.online || p.avif || p.url || '').filter(Boolean);
-  } catch (e) {
-    console.error('[ML] getPages erro:', e.message);
+    console.warn('[COMICK] search erro:', e.message);
     return [];
   }
+}
+
+async function comickGetManga(hid) {
+  try {
+    const data = await fetchJSON(`${COMICK_BASE}/comic/${hid}`, COMICK_HEADERS);
+    const comic = data.comic || data;
+    const cover = comic.md_covers?.[0];
+    const coverUrl = cover ? `https://meo.comick.pictures/${cover.b2key}` : null;
+    const title = comic.title || comic.slug || '';
+    const description = comic.desc || comic.summary || '';
+
+    // Busca capítulos — tenta PT-BR primeiro, depois EN
+    let chapters = [];
+    for (const lang of ['pt', 'en']) {
+      try {
+        const chData = await fetchJSON(
+          `${COMICK_BASE}/comic/${hid}/chapters?lang=${lang}&page=1&limit=100&chap-order=1`,
+          COMICK_HEADERS
+        );
+        const chList = chData.chapters || chData || [];
+        if (Array.isArray(chList) && chList.length > 0) {
+          chapters = chList.map(c => ({
+            id: c.hid,
+            title: c.title || `Capítulo ${c.chap}`,
+            chapterNumber: c.chap || '0',
+            lang,
+            source: 'comick',
+          }));
+          break;
+        }
+      } catch (_) {}
+    }
+
+    return { title, coverUrl, description, chapters, source: 'comick' };
+  } catch (e) {
+    console.error('[COMICK] getManga erro:', e.message);
+    return { title: '', description: '', chapters: [], source: 'comick' };
+  }
+}
+
+async function comickGetPages(chapterHid) {
+  try {
+    const data = await fetchJSON(
+      `${COMICK_BASE}/chapter/${chapterHid}`,
+      COMICK_HEADERS
+    );
+    const images = data.chapter?.md_images || data.md_images || [];
+    return images.map(img => `https://meo.comick.pictures/${img.b2key}`).filter(Boolean);
+  } catch (e) {
+    console.error('[COMICK] getPages erro:', e.message);
+    return [];
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ANILIST  (metadados ricos: sinopse, notas, banners, gêneros, status)
+//  Não entrega capítulos, mas enriquece o app com info de qualidade
+// ══════════════════════════════════════════════════════════════════════════════
+
+const ANILIST_GQL = 'https://graphql.anilist.co';
+
+async function anilistSearch(query) {
+  const gql = `
+    query ($search: String) {
+      Page(page: 1, perPage: 10) {
+        media(search: $search, type: MANGA, sort: SEARCH_MATCH) {
+          id
+          title { romaji english native }
+          coverImage { large extraLarge }
+          bannerImage
+          description(asHtml: false)
+          averageScore
+          genres
+          status
+          chapters
+          startDate { year }
+        }
+      }
+    }
+  `;
+  try {
+    const { buffer, status } = await fetchPOST(
+      ANILIST_GQL,
+      { query: gql, variables: { search: query } },
+      { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+    );
+    if (status !== 200) return [];
+    const json = JSON.parse(buffer.toString());
+    const media = json.data?.Page?.media || [];
+    return media.map(m => ({
+      id: `al:${m.id}`,
+      anilistId: m.id,
+      title: m.title.english || m.title.romaji || m.title.native || '',
+      coverUrl: m.coverImage?.extraLarge || m.coverImage?.large || null,
+      bannerUrl: m.bannerImage || null,
+      description: m.description || '',
+      score: m.averageScore || null,
+      genres: m.genres || [],
+      status: m.status || '',
+      totalChapters: m.chapters || null,
+      year: m.startDate?.year || null,
+      source: 'anilist',
+    }));
+  } catch (e) {
+    console.warn('[ANILIST] search erro:', e.message);
+    return [];
+  }
+}
+
+async function anilistGetMeta(anilistId) {
+  const gql = `
+    query ($id: Int) {
+      Media(id: $id, type: MANGA) {
+        id
+        title { romaji english native }
+        coverImage { extraLarge large }
+        bannerImage
+        description(asHtml: false)
+        averageScore
+        genres
+        status
+        chapters
+        startDate { year }
+        characters(sort: ROLE, page: 1, perPage: 6) {
+          nodes { name { full } image { medium } }
+        }
+      }
+    }
+  `;
+  try {
+    const { buffer } = await fetchPOST(
+      ANILIST_GQL,
+      { query: gql, variables: { id: Number(anilistId) } },
+      { 'Content-Type': 'application/json', 'Accept': 'application/json' }
+    );
+    const json = JSON.parse(buffer.toString());
+    const m = json.data?.Media;
+    if (!m) return null;
+    return {
+      anilistId: m.id,
+      title: m.title.english || m.title.romaji || '',
+      coverUrl: m.coverImage?.extraLarge || m.coverImage?.large || null,
+      bannerUrl: m.bannerImage || null,
+      description: m.description || '',
+      score: m.averageScore || null,
+      genres: m.genres || [],
+      status: m.status || '',
+      totalChapters: m.chapters || null,
+      year: m.startDate?.year || null,
+      characters: (m.characters?.nodes || []).map(c => ({
+        name: c.name?.full || '',
+        image: c.image?.medium || null,
+      })),
+    };
+  } catch (e) {
+    console.warn('[ANILIST] getMeta erro:', e.message);
+    return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  MANGADEX
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function mdxSearch(query) {
+  const data = await fetchJSON(
+    `https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`
+  );
+  if (!data.data?.length) return [];
+  return data.data.map(m => {
+    const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
+    const cover = m.relationships.find(r => r.type === 'cover_art');
+    return {
+      id: m.id,
+      title,
+      coverUrl: cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null,
+      source: 'mangadex'
+    };
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -351,19 +491,34 @@ function xorDecrypt(buf, hexKey) {
 
 app.get('/', (req, res) => res.json({
   status: 'ok',
-  version: '10.1-ids-corrigidos',
-  sources: ['mangaplus', 'mangalivre', 'mangadex'],
-  titulos_mapeados: Object.keys(MANGA_IDS).length
+  version: '11.0-multisource',
+  sources: ['mangaplus', 'comick', 'mangadex', 'anilist'],
+  titulos_mapeados: Object.keys(MANGA_IDS).length,
+  endpoints: ['/', '/search', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta']
 }));
 
-// GET /search?q=...
+// ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-  const { q } = req.query;
+  const { q, source } = req.query;
   if (!q) return res.status(400).json({ error: 'q obrigatório' });
-  console.log(`[SEARCH] "${q}"`);
+  console.log(`[SEARCH] "${q}" source="${source || 'auto'}"`);
 
-  // 1. MangaPlus (títulos Shueisha — mais rápido e confiável)
+  // Forçar fonte específica
+  if (source === 'comick') {
+    const r = await comickSearch(q);
+    return res.json({ results: r, source: 'comick' });
+  }
+  if (source === 'anilist') {
+    const r = await anilistSearch(q);
+    return res.json({ results: r, source: 'anilist' });
+  }
+  if (source === 'mangadex') {
+    try { const r = await mdxSearch(q); return res.json({ results: r, source: 'mangadex' }); }
+    catch (e) { return res.json({ results: [], source: 'mangadex' }); }
+  }
+
+  // 1. MangaPlus — títulos Shueisha (mais rápido, PT-BR oficial)
   try {
     const mp = await mpSearch(q);
     if (mp.length > 0) {
@@ -372,46 +527,35 @@ app.get('/search', async (req, res) => {
     }
   } catch (e) { console.warn('[SEARCH] MangaPlus erro:', e.message); }
 
-  // 2. Mangá Livre (arquivo completo PT-BR)
+  // 2. Comick — catálogo enorme, inclui clássicos e títulos BR
   try {
-    const ml = await mlSearch(q);
-    if (ml.length > 0) {
-      console.log(`[SEARCH] MangaLivre: ${ml.length}`);
-      return res.json({ results: ml, source: 'mangalivre' });
+    const ck = await comickSearch(q);
+    if (ck.length > 0) {
+      console.log(`[SEARCH] Comick: ${ck.length}`);
+      return res.json({ results: ck, source: 'comick' });
     }
-  } catch (e) { console.warn('[SEARCH] MangaLivre erro:', e.message); }
+  } catch (e) { console.warn('[SEARCH] Comick erro:', e.message); }
 
-  // 3. MangaDex (fallback)
+  // 3. MangaDex — fallback amplo
   try {
-    const data = await fetchJSON(
-      `https://api.mangadex.org/manga?title=${encodeURIComponent(q)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`
-    );
-    if (data.data?.length > 0) {
-      const results = data.data.map(m => {
-        const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
-        const cover = m.relationships.find(r => r.type === 'cover_art');
-        return {
-          id: m.id,
-          title,
-          coverUrl: cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null,
-          source: 'mangadex'
-        };
-      });
-      console.log(`[SEARCH] MangaDex: ${results.length}`);
-      return res.json({ results, source: 'mangadex' });
+    const mdx = await mdxSearch(q);
+    if (mdx.length > 0) {
+      console.log(`[SEARCH] MangaDex: ${mdx.length}`);
+      return res.json({ results: mdx, source: 'mangadex' });
     }
   } catch (e) { console.error('[SEARCH] MangaDex erro:', e.message); }
 
   res.json({ results: [], source: 'none' });
 });
 
-// GET /manga?id=...&source=...
+// ─── GET /manga?id=...&source=... ─────────────────────────────────────────────
 app.get('/manga', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   const { id, source } = req.query;
   if (!id) return res.status(400).json({ error: 'id obrigatório' });
   console.log(`[MANGA] id="${id}" source="${source}"`);
 
+  // MangaPlus
   if (source === 'mangaplus' || /^\d{5,7}$/.test(id)) {
     try {
       const d = await mpGetTitle(id);
@@ -420,50 +564,56 @@ app.get('/manga', async (req, res) => {
     } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); }
   }
 
-  if (source === 'mangalivre') {
+  // Comick
+  if (source === 'comick') {
     try {
-      const d = await mlGetManga(id);
-      console.log(`[MANGA] MangaLivre: "${d.title}" | ${d.chapters.length} caps`);
+      const d = await comickGetManga(id);
+      console.log(`[MANGA] Comick: "${d.title}" | ${d.chapters.length} caps`);
       return res.json(d);
-    } catch (e) { console.error('[MANGA] MangaLivre erro:', e.message); }
+    } catch (e) { console.error('[MANGA] Comick erro:', e.message); }
   }
 
   // MangaDex
-  try {
-    const m = (await fetchJSON(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`)).data;
-    const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
-    const cover = m.relationships.find(r => r.type === 'cover_art');
-    const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
-    const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
-    let chapters = [];
-    for (const lang of ['pt-br', 'en']) {
-      try {
-        const cd = await fetchJSON(
-          `https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`
-        );
-        if (cd.data?.length > 0) {
-          chapters = cd.data.map(ch => ({
-            id: ch.id,
-            title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
-            chapterNumber: ch.attributes.chapter || '0',
-            lang,
-            source: 'mangadex'
-          }));
-          break;
-        }
-      } catch (_) {}
-    }
-    return res.json({ title, coverUrl, description: desc, chapters, source: 'mangadex' });
-  } catch (e) { return res.status(500).json({ error: e.message }); }
+  if (isUuid(id) || source === 'mangadex') {
+    try {
+      const m = (await fetchJSON(`https://api.mangadex.org/manga/${id}?includes[]=cover_art`)).data;
+      const title = m.attributes.title.en || m.attributes.title['pt-br'] || Object.values(m.attributes.title)[0] || '';
+      const cover = m.relationships.find(r => r.type === 'cover_art');
+      const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
+      const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
+      let chapters = [];
+      for (const lang of ['pt-br', 'en']) {
+        try {
+          const cd = await fetchJSON(
+            `https://api.mangadex.org/manga/${id}/feed?translatedLanguage[]=${lang}&order[chapter]=desc&limit=100`
+          );
+          if (cd.data?.length > 0) {
+            chapters = cd.data.map(ch => ({
+              id: ch.id,
+              title: ch.attributes.title || `Capítulo ${ch.attributes.chapter}`,
+              chapterNumber: ch.attributes.chapter || '0',
+              lang,
+              source: 'mangadex'
+            }));
+            break;
+          }
+        } catch (_) {}
+      }
+      return res.json({ title, coverUrl, description: desc, chapters, source: 'mangadex' });
+    } catch (e) { return res.status(500).json({ error: e.message }); }
+  }
+
+  res.status(404).json({ error: 'Fonte não reconhecida ou manga não encontrado' });
 });
 
-// GET /chapter?id=...&source=...
+// ─── GET /chapter?id=...&source=... ──────────────────────────────────────────
 app.get('/chapter', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   const { id, source } = req.query;
   if (!id) return res.status(400).json({ error: 'id obrigatório' });
   console.log(`[CHAPTER] id="${id}" source="${source}"`);
 
+  // MangaPlus
   if (source === 'mangaplus' || /^\d{6,10}$/.test(id)) {
     try {
       const pageData = await mpGetPages(id);
@@ -478,16 +628,18 @@ app.get('/chapter', async (req, res) => {
     } catch (e) { console.error('[CHAPTER] MangaPlus erro:', e.message); }
   }
 
-  if (source === 'mangalivre') {
+  // Comick
+  if (source === 'comick') {
     try {
-      const pages = await mlGetPages(id);
+      const pages = await comickGetPages(id);
       if (pages.length > 0) {
-        console.log(`[CHAPTER] MangaLivre: ${pages.length} páginas`);
-        return res.json({ pages, source: 'mangalivre' });
+        console.log(`[CHAPTER] Comick: ${pages.length} páginas`);
+        return res.json({ pages, source: 'comick' });
       }
-    } catch (e) { console.error('[CHAPTER] MangaLivre erro:', e.message); }
+    } catch (e) { console.error('[CHAPTER] Comick erro:', e.message); }
   }
 
+  // MangaDex
   if (isUuid(id)) {
     try {
       const data = await fetchJSON(`https://api.mangadex.org/at-home/server/${id}`);
@@ -504,7 +656,7 @@ app.get('/chapter', async (req, res) => {
   res.json({ pages: [], source: 'none' });
 });
 
-// GET /image-proxy?url=...&key=...
+// ─── GET /image-proxy?url=...&key=... ────────────────────────────────────────
 app.get('/image-proxy', async (req, res) => {
   const { url, key } = req.query;
   if (!url) return res.status(400).send('url obrigatório');
@@ -521,7 +673,27 @@ app.get('/image-proxy', async (req, res) => {
   } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
-// GET /titles — lista todos os títulos mapeados
+// ─── GET /meta?q=...  ou  /meta?id=123 — metadados ricos via AniList ─────────
+// Use para buscar sinopse, banner, nota, gêneros antes de mostrar a tela do manga
+app.get('/meta', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const { q, id } = req.query;
+
+  if (id) {
+    const meta = await anilistGetMeta(id);
+    if (!meta) return res.status(404).json({ error: 'não encontrado' });
+    return res.json(meta);
+  }
+
+  if (q) {
+    const results = await anilistSearch(q);
+    return res.json({ results });
+  }
+
+  res.status(400).json({ error: 'q ou id obrigatório' });
+});
+
+// ─── GET /titles — lista todos os títulos MangaPlus mapeados ─────────────────
 app.get('/titles', (req, res) => {
   const unique = {};
   for (const [name, id] of Object.entries(MANGA_IDS)) {
@@ -530,7 +702,7 @@ app.get('/titles', (req, res) => {
   res.json({ total: Object.keys(unique).length, titles: Object.values(unique) });
 });
 
-// GET /debug?id=... — testa um ID do MangaPlus direto
+// ─── GET /debug?id=... ───────────────────────────────────────────────────────
 app.get('/debug', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.json({ ids_mapeados: MANGA_IDS });
@@ -542,4 +714,4 @@ app.get('/debug', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Proxy v10.1 (IDs corrigidos) na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy v11.0 (multisource) na porta ${PORT}`));
