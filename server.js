@@ -82,7 +82,7 @@ const pb = b => Buffer.from(b);
 
 // Endpoints atuais do MangaPlus (confirmados em 2024/2025):
 const MP = 'https://jumpg-webapi.tokyo-cdn.com/api';
-const MP_HDR = { 'Origin': 'https://mangaplus.shueisha.co.jp', 'Referer': 'https://mangaplus.shueisha.co.jp/' };
+const MP_HDR = { 'Origin': 'https://mangaplus.shueisha.co.jp', 'Referer': 'https://mangaplus.shueisha.co.jp/', 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' };
 
 async function mpRaw(path) {
   const { buffer, status } = await fetchRaw(`${MP}${path}`, MP_HDR);
@@ -200,7 +200,7 @@ function xorDecrypt(buf, hexKey) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '6.0-allV3' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '6.1-ptbr' }));
 
 // ─── DEBUG — mostra a estrutura real da resposta ───────────────────────────────
 app.get('/debug', async (req, res) => {
@@ -285,7 +285,7 @@ app.get('/manga', async (req, res) => {
       const d = await mpGetTitle(id);
       console.log(`[MANGA] MangaPlus: "${d.title}" | ${d.chapters.length} caps`);
       return res.json({ ...d, source: 'mangaplus' });
-    } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); return res.json({ error: e.message, source: 'mangaplus_failed' }); }
+    } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); }
   }
 
   try {
@@ -350,4 +350,4 @@ app.get('/image-proxy', async (req, res) => {
   } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
-app.listen(PORT, () => console.log(`Manga Proxy v6 (allV3 + title_detail_v3) na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Manga Proxy v6.1 (PT-BR + allV3) na porta ${PORT}`));
