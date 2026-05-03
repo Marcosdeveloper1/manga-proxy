@@ -295,16 +295,27 @@ async function comickGetManga(mangaId, mangaUrl) {
   try {
     console.log(`[COMICK] getManga id="${mangaId}" url="${mangaUrl}"`);
 
-    // Se não veio URL direto, busca pelo título para achar a URL
+    // Se não veio URL, tenta montar a partir do ID ou buscar
     if (!mangaUrl) {
-      const searchResp = await fetchPOST(`${COMICK_BASE}/search`, { query: mangaId, source: 'all' });
-      const objects = parseJsonStream(searchResp.buffer.toString('utf8'));
-      for (const obj of objects) {
-        if (obj.results && obj.results[0] && obj.results[0].url) {
-          mangaUrl = obj.results[0].url;
-          console.log(`[COMICK] URL encontrada via busca: ${mangaUrl}`);
-          break;
+      // IDs curtos (ex: emqg8, wmkdr) = Comix.to
+      if (/^[a-z0-9]{4,8}$/.test(mangaId)) {
+        mangaUrl = `https://comix.to/title/${mangaId}`;
+        console.log(`[COMICK] URL montada (comix): ${mangaUrl}`);
+      }
+      // IDs com hífen (ex: solo-leveling-mg1) = MangaLoom ou MangaPark
+      else if (mangaId.includes('-')) {
+        // Tenta buscar para achar a URL certa
+        const searchResp = await fetchPOST(`${COMICK_BASE}/search`, { query: mangaId.replace(/-/g, ' '), source: 'all' });
+        const objects = parseJsonStream(searchResp.buffer.toString('utf8'));
+        for (const obj of objects) {
+          if (obj.results) {
+            const match = obj.results.find(r => r.id === mangaId || r.url?.includes(mangaId));
+            if (match && match.url) { mangaUrl = match.url; break; }
+            // Pega o primeiro se não achou match exato
+            if (!mangaUrl && obj.results[0]?.url) mangaUrl = obj.results[0].url;
+          }
         }
+        console.log(`[COMICK] URL via busca: ${mangaUrl}`);
       }
     }
 
