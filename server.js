@@ -81,6 +81,517 @@ function parseJsonStream(text) {
 app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*'); next(); });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  FLARESOLVERR — bypass Cloudflare para sites BR
+//  URL configurável via env var FLARESOLVERR_URL
+//  Estratégia: sessão persistente por domínio + cache de cookies (15 min)
+//  Requests subsequentes ao mesmo domínio reutilizam o browser já aberto
+// ══════════════════════════════════════════════════════════════════════════════
+
+const FLARE_URL = (process.env.FLARESOLVERR_URL || 'https://flaresolverr-production-ed33.up.railway.app').replace(/\/$/, '');
+const FLARE_TIMEOUT = 60000; // 60s para resolver o desafio
+
+// Sessões ativas por domínio: domain → { sessionId, userAgent, cookies, ts }
+const flareSessions = {};
+const FLARE_SESSION_TTL = 14 * 60 * 1000; // 14 minutos (Cloudflare cookie dura ~15min)
+
+function getDomain(url) {
+  try { return new URL(url).hostname; } catch { return url; }
+}
+
+// Chama o FlareSolverr e retorna { html, cookies, userAgent }
+async function flareGet(url, useSession = true) {
+  const domain = getDomain(url);
+  const now = Date.now();
+
+  // Reutiliza sessão ativa se válida
+  let sessionId = null;
+  if (useSession && flareSessions[domain] && (now - flareSessions[domain].ts) < FLARE_SESSION_TTL) {
+    sessionId = flareSessions[domain].sessionId;
+    console.log(`[FLARE] sessão reutilizada para ${domain} (${sessionId.slice(0, 8)}...)`);
+  }
+
+  const body = {
+    cmd: 'request.get',
+    url,
+    maxTimeout: FLARE_TIMEOUT,
+    ...(sessionId ? { session: sessionId } : {}),
+  };
+
+  const { buffer, status } = await fetchPOST(`${FLARE_URL}/v1`, body, {}, FLARE_TIMEOUT + 5000);
+  if (status !== 200) throw new Error(`FlareSolverr HTTP ${status}`);
+
+  const json = JSON.parse(buffer.toString('utf8'));
+  if (json.status !== 'ok') throw new Error(`FlareSolverr: ${json.message || 'erro desconhecido'}`);
+
+  const sol = json.solution;
+
+  // Salva/atualiza sessão
+  if (useSession) {
+    // Se não tinha sessão, cria uma persistente para requests futuros
+    if (!sessionId) {
+      try {
+        const createBody = { cmd: 'sessions.create' };
+        const cr = await fetchPOST(`${FLARE_URL}/v1`, createBody, {}, 10000);
+        const crJson = JSON.parse(cr.buffer.toString('utf8'));
+        if (crJson.status === 'ok') {
+          flareSessions[domain] = {
+            sessionId: crJson.session,
+            userAgent: sol.userAgent,
+            cookies: sol.cookies,
+            ts: now,
+          };
+          console.log(`[FLARE] nova sessão criada para ${domain}: ${crJson.session.slice(0, 8)}...`);
+        }
+      } catch (e) {
+        console.warn(`[FLARE] falha ao criar sessão: ${e.message}`);
+        // Salva sem sessão persistente (stateless)
+        flareSessions[domain] = { sessionId: null, userAgent: sol.userAgent, cookies: sol.cookies, ts: now };
+      }
+    } else {
+      flareSessions[domain].ts = now; // Renova timestamp
+      flareSessions[domain].cookies = sol.cookies;
+    }
+  }
+
+  console.log(`[FLARE] ✓ ${domain} | ${sol.status} | ${sol.response?.length || 0} chars`);
+  return {
+    html: sol.response || '',
+    cookies: sol.cookies || [],
+    userAgent: sol.userAgent || '',
+    status: sol.status,
+  };
+}
+
+// fetchRaw com cookies do FlareSolverr (para requests subsequentes rápidos)
+async function flareRawWithCookies(url) {
+  const domain = getDomain(url);
+  const session = flareSessions[domain];
+  if (!session) return flareGet(url); // sem sessão, usa FlareSolverr normal
+
+  const cookieStr = session.cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  const { buffer, status } = await fetchRaw(url, {
+    'User-Agent': session.userAgent,
+    'Cookie': cookieStr,
+    'Accept': 'text/html,application/xhtml+xml,*/*',
+    'Accept-Language': 'pt-BR,pt;q=0.9',
+    'Referer': `https://${domain}/`,
+  });
+
+  // Cookie expirou → re-resolve via FlareSolverr
+  if (status === 403 || status === 503) {
+    console.warn(`[FLARE] cookie expirado para ${domain}, re-resolvendo...`);
+    delete flareSessions[domain];
+    return flareGet(url);
+  }
+
+  return { html: buffer.toString('utf8'), status, cookies: session.cookies, userAgent: session.userAgent };
+}
+
+// Limpa sessões expiradas a cada 20 minutos
+setInterval(async () => {
+  const now = Date.now();
+  for (const [domain, sess] of Object.entries(flareSessions)) {
+    if ((now - sess.ts) > FLARE_SESSION_TTL) {
+      console.log(`[FLARE] expirando sessão de ${domain}`);
+      if (sess.sessionId) {
+        try {
+          await fetchPOST(`${FLARE_URL}/v1`, { cmd: 'sessions.destroy', session: sess.sessionId }, {}, 5000);
+        } catch (_) {}
+      }
+      delete flareSessions[domain];
+    }
+  }
+}, 20 * 60 * 1000);
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  SCRAPERS PARA SITES BR (via FlareSolverr)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers de parsing HTML ──────────────────────────────────────────────────
+
+function htmlAttr(html, tag, attr, nth = 0) {
+  const regex = new RegExp(`<${tag}[^>]+${attr}="([^"]*)"`, 'gi');
+  let m, i = 0;
+  while ((m = regex.exec(html)) !== null) { if (i++ === nth) return m[1]; }
+  return null;
+}
+
+function htmlText(html, selector) {
+  const m = html.match(new RegExp(`<${selector}[^>]*>([^<]*)<\/${selector}>`, 'i'));
+  return m ? m[1].trim() : '';
+}
+
+function extractImgUrls(html) {
+  const seen = new Set();
+  const urls = [];
+  // Padrão 1: Next.js __NEXT_DATA__
+  const nextM = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (nextM) {
+    try {
+      const nd = JSON.parse(nextM[1]);
+      const all = JSON.stringify(nd).match(/https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?/gi) || [];
+      for (const u of all) if (!seen.has(u) && isPageImg(u)) { seen.add(u); urls.push(u); }
+      if (urls.length > 3) return urls.slice(0, 120);
+    } catch (_) {}
+  }
+  // Padrão 2: scripts genéricos
+  const scripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const sc of scripts) {
+    const all = sc.match(/https:\/\/[^"']+\.(?:jpg|jpeg|png|webp)(?:\?[^"']*)?/gi) || [];
+    for (const u of all) if (!seen.has(u) && isPageImg(u)) { seen.add(u); urls.push(u); }
+    if (urls.length > 5) break;
+  }
+  // Padrão 3: img tags
+  const imgs = html.match(/(?:src|data-src|data-lazy-src)="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi) || [];
+  for (const m of imgs) {
+    const u = m.replace(/(?:src|data-src|data-lazy-src)="|"$/gi, '');
+    if (!seen.has(u) && isPageImg(u)) { seen.add(u); urls.push(u); }
+  }
+  return urls.slice(0, 120);
+}
+
+function isPageImg(url) {
+  return url.length > 40
+    && !url.includes('/thumb') && !url.includes('thumbnail')
+    && !url.includes('/avatar') && !url.includes('/logo')
+    && !url.includes('/banner') && !url.includes('/icon')
+    && !url.includes('gravatar') && !url.includes('facebook');
+}
+
+// ── LerMangas ────────────────────────────────────────────────────────────────
+// Site: https://lermangas.me  — WordPress/Madara theme
+
+async function lerSearch(query) {
+  const cached = getCachedSearch('lermangas', query);
+  if (cached) { console.log('[LER] cache hit'); return cached; }
+  try {
+    const { html } = await flareGet(`https://lermangas.me/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
+    const results = [];
+    const itemRx = /<div class="post-title"[^>]*>[\s\S]*?<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const imgRx = /<img[^>]+(?:src|data-src)="([^"]+)"[^>]*class="[^"]*img-responsive[^"]*"/gi;
+    let m;
+    const titles = [];
+    while ((m = itemRx.exec(html)) !== null) {
+      titles.push({ url: m[1], title: m[2].replace(/<[^>]+>/g, '').trim() });
+    }
+    // Pega covers
+    const covers = [];
+    let cm;
+    const coverRx = /class="tab-thumb"[\s\S]*?<img[^>]+(?:src|data-src)="([^"]+)"/gi;
+    while ((cm = coverRx.exec(html)) !== null) covers.push(cm[1]);
+
+    for (let i = 0; i < Math.min(titles.length, 15); i++) {
+      const { url, title } = titles[i];
+      const slug = url.replace(/\/$/, '').split('/').pop();
+      results.push({
+        id: `ler:${slug}`,
+        title,
+        coverUrl: covers[i] || null,
+        url,
+        source: 'lermangas',
+      });
+    }
+    console.log(`[LER] ${results.length} resultados`);
+    setCachedSearch('lermangas', query, results);
+    return results;
+  } catch (e) { console.error('[LER] search erro:', e.message); return []; }
+}
+
+async function lerGetManga(slug) {
+  try {
+    const url = `https://lermangas.me/manga/${slug}/`;
+    const { html } = await flareGet(url);
+
+    // Título
+    const titleM = html.match(/<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
+      || html.match(/<title>([^<|]+)/i);
+    const title = titleM ? titleM[1].replace(/<[^>]+>/g, '').trim() : slug;
+
+    // Cover
+    const coverM = html.match(/class="summary-image"[\s\S]*?<img[^>]+(?:src|data-src)="([^"]+)"/i);
+    const coverUrl = coverM ? coverM[1] : null;
+
+    // Capítulos (Madara theme)
+    const chapRx = /<li[^>]*class="[^"]*wp-manga-chapter[^"]*"[^>]*>[\s\S]*?<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    const chapters = [];
+    let cm;
+    let i = 0;
+    while ((cm = chapRx.exec(html)) !== null) {
+      const chUrl = cm[1];
+      const chTitle = cm[2].replace(/<[^>]+>/g, '').trim();
+      const numM = chTitle.match(/[\d.]+/);
+      chapters.push({
+        id: `ler:${Buffer.from(chUrl).toString('base64')}`,
+        title: chTitle,
+        chapterNumber: numM ? numM[0] : String(i),
+        source: 'lermangas',
+      });
+      i++;
+    }
+
+    console.log(`[LER] "${title}" | ${chapters.length} caps`);
+    return { title, coverUrl, description: '', chapters, source: 'lermangas' };
+  } catch (e) {
+    console.error('[LER] getManga erro:', e.message);
+    return { title: slug, coverUrl: null, description: '', chapters: [], source: 'lermangas' };
+  }
+}
+
+async function lerGetPages(b64url) {
+  try {
+    const chUrl = Buffer.from(b64url, 'base64').toString('utf8');
+    const { html } = await flareRawWithCookies(chUrl);
+    return extractImgUrls(html);
+  } catch (e) { console.error('[LER] getPages erro:', e.message); return []; }
+}
+
+// ── Tatakae Scan ─────────────────────────────────────────────────────────────
+// Site: https://tatakaescan.com — também Madara theme
+
+async function tatakaeSearch(query) {
+  const cached = getCachedSearch('tatakae', query);
+  if (cached) { console.log('[TATAKAE] cache hit'); return cached; }
+  try {
+    const { html } = await flareGet(`https://tatakaescan.com/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
+    const results = parseMadaraSearchResults(html, 'tatakaescan.com', 'tatakae');
+    console.log(`[TATAKAE] ${results.length} resultados`);
+    setCachedSearch('tatakae', query, results);
+    return results;
+  } catch (e) { console.error('[TATAKAE] search erro:', e.message); return []; }
+}
+
+// ── Sakura Mangas ─────────────────────────────────────────────────────────────
+// Site: https://sakuramangas.org — Madara theme
+
+async function sakuraSearch(query) {
+  const cached = getCachedSearch('sakura', query);
+  if (cached) { console.log('[SAKURA] cache hit'); return cached; }
+  try {
+    const { html } = await flareGet(`https://sakuramangas.org/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
+    const results = parseMadaraSearchResults(html, 'sakuramangas.org', 'sakura');
+    console.log(`[SAKURA] ${results.length} resultados`);
+    setCachedSearch('sakura', query, results);
+    return results;
+  } catch (e) { console.error('[SAKURA] search erro:', e.message); return []; }
+}
+
+// ── Taiyo.moe ─────────────────────────────────────────────────────────────────
+async function taiyoSearch(query) {
+  const cached = getCachedSearch('taiyo', query);
+  if (cached) { console.log('[TAIYO] cache hit'); return cached; }
+  try {
+    const { html } = await flareGet(`https://taiyo.moe/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
+    const results = parseMadaraSearchResults(html, 'taiyo.moe', 'taiyo');
+    console.log(`[TAIYO] ${results.length} resultados`);
+    setCachedSearch('taiyo', query, results);
+    return results;
+  } catch (e) { console.error('[TAIYO] search erro:', e.message); return []; }
+}
+
+// ── Kakusei Project ────────────────────────────────────────────────────────────
+async function kakuseiSearch(query) {
+  const cached = getCachedSearch('kakusei', query);
+  if (cached) { console.log('[KAKUSEI] cache hit'); return cached; }
+  try {
+    const { html } = await flareGet(`https://kakuseiproject.com/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
+    const results = parseMadaraSearchResults(html, 'kakuseiproject.com', 'kakusei');
+    console.log(`[KAKUSEI] ${results.length} resultados`);
+    setCachedSearch('kakusei', query, results);
+    return results;
+  } catch (e) { console.error('[KAKUSEI] search erro:', e.message); return []; }
+}
+
+// ── Parser genérico Madara WordPress theme ────────────────────────────────────
+// Todos esses sites usam o mesmo tema (WP Manga / Madara)
+function parseMadaraSearchResults(html, domain, sourcePrefix) {
+  const results = [];
+  // Padrão do tema Madara: cards de manga
+  const cardRx = /<div class="[^"]*post-title[^"]*"[\s\S]*?<a href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const coverRx = /<div class="[^"]*item-thumb[^"]*"[\s\S]*?<img[^>]+(?:src|data-src|data-srcset)="([^"\s]+)"/gi;
+
+  const titles = [];
+  let m;
+  while ((m = cardRx.exec(html)) !== null) {
+    const url = m[1];
+    if (!url.includes(`${domain}/manga/`) && !url.includes(`${domain}/series/`)) continue;
+    titles.push({ url, title: m[2].replace(/<[^>]+>/g, '').trim() });
+  }
+
+  const covers = [];
+  let cv;
+  while ((cv = coverRx.exec(html)) !== null) {
+    const u = cv[1].split(' ')[0]; // data-srcset pode ter múltiplos
+    covers.push(u);
+  }
+
+  for (let i = 0; i < Math.min(titles.length, 15); i++) {
+    const { url, title } = titles[i];
+    const slug = url.replace(/\/$/, '').split('/').pop();
+    results.push({
+      id: `${sourcePrefix}:${slug}`,
+      title,
+      coverUrl: covers[i] || null,
+      url,
+      source: sourcePrefix,
+    });
+  }
+  return results;
+}
+
+// ── getManga e getPages genéricos para todos os sites Madara ─────────────────
+async function madaraGetManga(mangaUrl, sourcePrefix) {
+  try {
+    const { html } = await flareGet(mangaUrl);
+    const domain = getDomain(mangaUrl);
+
+    const titleM = html.match(/<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/i)
+      || html.match(/<div class="post-title"[^>]*>[\s\S]*?<h[12][^>]*>([\s\S]*?)<\/h[12]>/i)
+      || html.match(/<title>([^<|–-]+)/i);
+    const title = titleM ? titleM[1].replace(/<[^>]+>/g, '').trim() : mangaUrl;
+
+    const coverM = html.match(/class="summary-image"[\s\S]*?<img[^>]+(?:src|data-src)="([^"]+)"/i)
+      || html.match(/<div class="[^"]*tab-summary[^"]*"[\s\S]*?<img[^>]+(?:src|data-src)="([^"]+)"/i);
+    const coverUrl = coverM ? coverM[1] : null;
+
+    // Capítulos — tenta lista inline e depois AJAX endpoint do Madara
+    let chapters = parseMadaraChapters(html, mangaUrl, sourcePrefix);
+
+    // Se não achou capítulos inline, tenta o AJAX do Madara (wp-admin/admin-ajax.php)
+    if (chapters.length === 0) {
+      try {
+        const postIdM = html.match(/var manga_id\s*=\s*['"]*(\d+)/i)
+          || html.match(/manga_id['"]\s*:\s*['"]*(\d+)/i)
+          || html.match(/data-id="(\d+)"/i);
+        if (postIdM) {
+          const postId = postIdM[1];
+          const ajaxUrl = `https://${domain}/wp-admin/admin-ajax.php`;
+          const { buffer } = await fetchPOST(ajaxUrl, {},
+            { 'Content-Type': 'application/x-www-form-urlencoded' }, 10000);
+          // POST form-urlencoded
+          const formBody = `action=manga_get_chapters&manga=${postId}`;
+          const ajaxResp = await new Promise((resolve, reject) => {
+            const data = formBody;
+            const urlObj = new URL(ajaxUrl);
+            const opts = {
+              hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Content-Length': Buffer.byteLength(data),
+                'User-Agent': flareSessions[domain]?.userAgent || 'Mozilla/5.0',
+                'Cookie': (flareSessions[domain]?.cookies || []).map(c => `${c.name}=${c.value}`).join('; '),
+                'Referer': mangaUrl,
+                'X-Requested-With': 'XMLHttpRequest',
+              }
+            };
+            const req = https.request(opts, (res) => {
+              const chunks = [];
+              res.on('data', c => chunks.push(c));
+              res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+            });
+            req.on('error', reject);
+            req.write(data);
+            req.end();
+          });
+          chapters = parseMadaraChapters(ajaxResp, mangaUrl, sourcePrefix);
+          console.log(`[MADARA] AJAX: ${chapters.length} caps para ${title}`);
+        }
+      } catch (e) { console.warn(`[MADARA] AJAX erro: ${e.message}`); }
+    }
+
+    console.log(`[${sourcePrefix.toUpperCase()}] "${title}" | ${chapters.length} caps`);
+    return { title, coverUrl, description: '', chapters, source: sourcePrefix };
+  } catch (e) {
+    console.error(`[${sourcePrefix.toUpperCase()}] getManga erro:`, e.message);
+    return { title: mangaUrl, coverUrl: null, description: '', chapters: [], source: sourcePrefix };
+  }
+}
+
+function parseMadaraChapters(html, baseUrl, sourcePrefix) {
+  const chapters = [];
+  const chapRx = /<li[^>]*class="[^"]*wp-manga-chapter[^"]*"[^>]*>[\s\S]*?<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let cm, i = 0;
+  while ((cm = chapRx.exec(html)) !== null) {
+    const chUrl = cm[1];
+    const chTitle = cm[2].replace(/<[^>]+>/g, '').trim();
+    const numM = chTitle.match(/[\d.]+/);
+    chapters.push({
+      id: `${sourcePrefix}:${Buffer.from(chUrl).toString('base64')}`,
+      title: chTitle || `Capítulo ${i + 1}`,
+      chapterNumber: numM ? numM[0] : String(i),
+      source: sourcePrefix,
+    });
+    i++;
+  }
+  return chapters;
+}
+
+async function madaraGetPages(b64url, sourcePrefix) {
+  try {
+    const chUrl = Buffer.from(b64url, 'base64').toString('utf8');
+    console.log(`[${sourcePrefix.toUpperCase()}] lendo: ${chUrl}`);
+    const { html } = await flareRawWithCookies(chUrl);
+    const pages = extractImgUrls(html);
+    console.log(`[${sourcePrefix.toUpperCase()}] ${pages.length} páginas`);
+    return pages;
+  } catch (e) {
+    console.error(`[${sourcePrefix.toUpperCase()}] getPages erro:`, e.message);
+    return [];
+  }
+}
+
+// Mapeamento source → funções
+const BR_SOURCES = {
+  lermangas: {
+    search: lerSearch,
+    getManga: (id) => {
+      const slug = id.replace(/^ler:/, '');
+      return lerGetManga(slug);
+    },
+    getPages: (b64) => lerGetPages(b64),
+  },
+  tatakae: {
+    search: tatakaeSearch,
+    getManga: (id) => {
+      const slug = id.replace(/^tatakae:/, '');
+      return madaraGetManga(`https://tatakaescan.com/manga/${slug}/`, 'tatakae');
+    },
+    getPages: (b64) => madaraGetPages(b64, 'tatakae'),
+  },
+  sakura: {
+    search: sakuraSearch,
+    getManga: (id) => {
+      const slug = id.replace(/^sakura:/, '');
+      return madaraGetManga(`https://sakuramangas.org/manga/${slug}/`, 'sakura');
+    },
+    getPages: (b64) => madaraGetPages(b64, 'sakura'),
+  },
+  taiyo: {
+    search: taiyoSearch,
+    getManga: (id) => {
+      const slug = id.replace(/^taiyo:/, '');
+      return madaraGetManga(`https://taiyo.moe/manga/${slug}/`, 'taiyo');
+    },
+    getPages: (b64) => madaraGetPages(b64, 'taiyo'),
+  },
+  kakusei: {
+    search: kakuseiSearch,
+    getManga: (id) => {
+      const slug = id.replace(/^kakusei:/, '');
+      return madaraGetManga(`https://kakuseiproject.com/manga/${slug}/`, 'kakusei');
+    },
+    getPages: (b64) => madaraGetPages(b64, 'kakusei'),
+  },
+};
+
+function getBrSource(id, source) {
+  if (source && BR_SOURCES[source]) return source;
+  for (const prefix of Object.keys(BR_SOURCES)) {
+    if (id && id.startsWith(`${prefix}:`)) return prefix;
+  }
+  return null;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  CACHE GERAL DE BUSCA  (evita re-buscar o mesmo termo)
 //  searchCache[source][query] = { results, ts }
 // ══════════════════════════════════════════════════════════════════════════════
