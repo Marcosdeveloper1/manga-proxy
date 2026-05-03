@@ -81,12 +81,17 @@ app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*');
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  CACHE DO COMICK
-//  comickUrlCache[mangaId]  = URL principal (string)
-//  comickAllUrls[mangaId]   = todas as URLs de todas as sources (array)
-//    → permite tentar fonte por fonte até achar capítulos
+//  comickById[id]      = { url, title, coverUrl, sourceId }
+//  comickByTitle[key]  = [{ id, url, sourceId }, ...]  ← TODOS os IDs do mesmo título
+//  Isso permite que /manga?id=emqg8 tente mgeko, flamecomics etc. quando Comix falha
 // ══════════════════════════════════════════════════════════════════════════════
-const comickUrlCache = {};
-const comickAllUrls = {}; // { [mangaId]: [{url, sourceId, title}] }
+const comickById = {};
+const comickByTitle = {};
+
+function titleKey(t) {
+  // "Solo Leveling" e "Solo Leveling (Novel)" ficam em chaves diferentes — OK
+  return (t || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 40);
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  PROTOBUF READER
@@ -277,13 +282,18 @@ async function comickSearch(query) {
       for (const item of obj.results) {
         if (!item.id || !item.title) continue;
 
-        // Salva TODAS as URLs de TODAS as sources — permite tentar uma por uma em comickGetManga
+        // Salva entry por ID
         if (item.url) {
-          if (!comickAllUrls[item.id]) comickAllUrls[item.id] = [];
-          if (!comickAllUrls[item.id].find(u => u.url === item.url)) {
-            comickAllUrls[item.id].push({ url: item.url, sourceId });
+          comickById[item.id] = { url: item.url, title: item.title, coverUrl: item.coverImage || null, sourceId };
+        }
+
+        // Índice por título normalizado — agrupa todos os IDs do mesmo manga
+        const key = titleKey(item.title);
+        if (key) {
+          if (!comickByTitle[key]) comickByTitle[key] = [];
+          if (!comickByTitle[key].find(e => e.id === item.id)) {
+            comickByTitle[key].push({ id: item.id, url: item.url, sourceId });
           }
-          if (!comickUrlCache[item.id]) comickUrlCache[item.id] = item.url;
         }
 
         if (seenIds.has(item.id)) continue;
@@ -299,7 +309,7 @@ async function comickSearch(query) {
       }
     }
 
-    console.log(`[COMICK] ${results.length} resultados | ${Object.keys(comickAllUrls).length} IDs com URLs cacheadas`);
+    console.log(`[COMICK] ${results.length} resultados | ${Object.keys(comickById).length} IDs no cache`);
     return results.slice(0, 20);
   } catch (e) {
     console.error('[COMICK] search erro:', e.message);
@@ -307,102 +317,53 @@ async function comickSearch(query) {
   }
 }
 
-// Resolve a URL de um manga a partir do ID
-// Ordem: 1) URL passada direto  2) Cache  3) Monta por padrão  4) Rebusca
-async function resolveComickUrl(mangaId, providedUrl) {
-  // 1) URL fornecida pelo chamador
-  if (providedUrl && providedUrl.startsWith('http')) {
-    comickUrlCache[mangaId] = providedUrl;
-    return providedUrl;
-  }
-
-  // 2) Cache de buscas anteriores
-  if (comickUrlCache[mangaId]) {
-    console.log(`[COMICK] URL do cache: ${comickUrlCache[mangaId]}`);
-    return comickUrlCache[mangaId];
-  }
-
-  // 3) IDs curtos (ex: emqg8, wmkdr, q9rgr) → Comix.to
-  if (/^[a-z0-9]{4,8}$/.test(mangaId)) {
-    const url = `https://comix.to/title/${mangaId}`;
-    console.log(`[COMICK] URL construída (comix): ${url}`);
-    comickUrlCache[mangaId] = url;
-    return url;
-  }
-
-  // 4) IDs com hífen → busca pelo título derivado do ID
-  const query = mangaId.replace(/-\w{8}$/, '').replace(/-/g, ' ').trim();
-  console.log(`[COMICK] Rebuscando para ID "${mangaId}", query: "${query}"`);
-  try {
-    const response = await fetchPOST(`${COMICK_BASE}/search`, { query, source: 'all' });
-    const objects = parseJsonStream(response.buffer.toString('utf8'));
-    for (const obj of objects) {
-      if (!obj.results) continue;
-      // Tenta match exato por ID
-      const exact = obj.results.find(r => r.id === mangaId);
-      if (exact && exact.url) {
-        comickUrlCache[mangaId] = exact.url;
-        console.log(`[COMICK] Match exato na rebusca: ${exact.url}`);
-        return exact.url;
-      }
-      // Pega o primeiro resultado com URL válida
-      const first = obj.results.find(r => r.url);
-      if (first) {
-        comickUrlCache[mangaId] = first.url;
-        console.log(`[COMICK] Primeiro resultado na rebusca: ${first.url}`);
-        return first.url;
-      }
-    }
-  } catch (e) {
-    console.warn('[COMICK] rebusca erro:', e.message);
-  }
-
-  return null;
-}
-
 async function comickGetManga(mangaId, providedUrl) {
   try {
     console.log(`[COMICK] getManga id="${mangaId}"`);
 
-    // Monta lista de URLs para tentar — todas as sources conhecidas para esse ID
+    // Monta lista de URLs para tentar, em ordem de prioridade
     const urlsToTry = [];
+    const seen = new Set();
 
-    if (providedUrl && providedUrl.startsWith('http')) {
-      urlsToTry.push({ url: providedUrl, sourceId: 'provided' });
-      comickUrlCache[mangaId] = providedUrl;
-    }
-
-    // URLs cacheadas de buscas anteriores (todas as sources)
-    if (comickAllUrls[mangaId]) {
-      for (const entry of comickAllUrls[mangaId]) {
-        if (!urlsToTry.find(u => u.url === entry.url)) urlsToTry.push(entry);
+    function addUrl(url, sourceId) {
+      if (url && url.startsWith('http') && !seen.has(url)) {
+        seen.add(url);
+        urlsToTry.push({ url, sourceId });
       }
     }
 
-    // Fallback: URL do cache principal
-    if (comickUrlCache[mangaId] && !urlsToTry.find(u => u.url === comickUrlCache[mangaId])) {
-      urlsToTry.push({ url: comickUrlCache[mangaId], sourceId: 'cache' });
+    // 1) URL fornecida direto pelo Flutter
+    if (providedUrl) addUrl(providedUrl, 'provided');
+
+    // 2) URL direta do ID no cache
+    if (comickById[mangaId]) addUrl(comickById[mangaId].url, comickById[mangaId].sourceId);
+
+    // 3) TODOS os outros IDs com o mesmo título — cross-source lookup!
+    const myEntry = comickById[mangaId];
+    if (myEntry) {
+      const key = titleKey(myEntry.title);
+      const siblings = comickByTitle[key] || [];
+      for (const sib of siblings) {
+        if (sib.id !== mangaId) addUrl(sib.url, sib.sourceId);
+      }
     }
 
-    // Fallback: monta URL para IDs curtos (Comix.to)
-    if (/^[a-z0-9]{4,8}$/.test(mangaId) && !urlsToTry.length) {
-      urlsToTry.push({ url: `https://comix.to/title/${mangaId}`, sourceId: 'comix-auto' });
+    // 4) Fallback automático para IDs curtos do Comix
+    if (/^[a-z0-9]{4,8}$/.test(mangaId)) {
+      addUrl(`https://comix.to/title/${mangaId}`, 'comix-auto');
     }
 
-    // Fallback: rebusca se ainda não tem nada
+    // 5) Rebusca se ainda está vazio
     if (urlsToTry.length === 0) {
-      const query = mangaId.replace(/-w{8}$/, '').replace(/-/g, ' ').trim();
+      const query = mangaId.replace(/-[a-f0-9]{8}$/, '').replace(/-/g, ' ').trim();
       console.log(`[COMICK] Rebuscando: "${query}"`);
       try {
         const response = await fetchPOST(`${COMICK_BASE}/search`, { query, source: 'all' });
         const objects = parseJsonStream(response.buffer.toString('utf8'));
         for (const obj of objects) {
           if (!obj.results) continue;
-          for (const r of obj.results) {
-            if (r.url && !urlsToTry.find(u => u.url === r.url)) {
-              urlsToTry.push({ url: r.url, sourceId: (obj.source||'').toLowerCase() });
-            }
-          }
+          const srcId = (obj.source || '').toLowerCase();
+          for (const r of obj.results) addUrl(r.url, srcId);
         }
       } catch (e) { console.warn('[COMICK] rebusca erro:', e.message); }
     }
@@ -418,8 +379,8 @@ async function comickGetManga(mangaId, providedUrl) {
         const chapObjects = parseJsonStream(chapText);
 
         let chapters = [];
-        let title = mangaId;
-        let coverUrl = null;
+        let title = comickById[mangaId]?.title || mangaId;
+        let coverUrl = comickById[mangaId]?.coverUrl || null;
 
         for (const obj of chapObjects) {
           if (obj.title) title = obj.title;
@@ -444,14 +405,14 @@ async function comickGetManga(mangaId, providedUrl) {
           return { title, coverUrl, description: '', chapters, source: 'comick' };
         }
 
-        console.log(`[COMICK]   ✗ ${sourceId} retornou 0 capítulos`);
+        console.log(`[COMICK]   ✗ ${sourceId}: 0 capítulos`);
       } catch (e) {
         console.warn(`[COMICK]   ✗ ${sourceId} erro: ${e.message}`);
       }
     }
 
-    console.warn(`[COMICK] Todas as ${urlsToTry.length} URLs falharam`);
-    return { title: mangaId, coverUrl: null, description: '', chapters: [], source: 'comick' };
+    console.warn(`[COMICK] Todas as ${urlsToTry.length} URLs falharam para "${mangaId}"`);
+    return { title: comickById[mangaId]?.title || mangaId, coverUrl: comickById[mangaId]?.coverUrl || null, description: '', chapters: [], source: 'comick' };
   } catch (e) {
     console.error('[COMICK] getManga erro:', e.message);
     return { title: mangaId, coverUrl: null, description: '', chapters: [], source: 'comick' };
@@ -760,6 +721,62 @@ app.get('/titles', (req, res) => {
   }
   res.json({ total: Object.keys(unique).length, titles: Object.values(unique) });
 });
+
+// ─── GET /debug?id=... ───────────────────────────────────────────────────────
+app.get('/debug', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.json({ ids_mapeados: MANGA_IDS, comick_cache: Object.keys(comickUrlCache) });
+  try {
+    const d = await mpGetTitle(id);
+    res.json({ ok: true, titulo: d.title, capitulos: d.chapters.length, capa: d.coverUrl });
+  } catch (e) { res.json({ ok: false, erro: e.message }); }
+});
+
+// ─── GET /debug-comick?id=... ───────────────────────────────────────────────
+app.get('/debug-comick', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const { id } = req.query;
+  if (!id) return res.status(400).json({
+    error: 'id obrigatório',
+    cachedIds: Object.keys(comickById).slice(0, 30),
+    titleKeys: Object.keys(comickByTitle).slice(0, 20),
+  });
+
+  const entry = comickById[id];
+  const key = entry ? titleKey(entry.title) : null;
+  const siblings = key ? (comickByTitle[key] || []) : [];
+
+  // Testa todas as URLs relacionadas
+  const urlsToTest = [];
+  if (entry?.url) urlsToTest.push({ url: entry.url, sourceId: entry.sourceId });
+  for (const sib of siblings) {
+    if (sib.id !== id && sib.url && !urlsToTest.find(u => u.url === sib.url)) {
+      urlsToTest.push({ url: sib.url, sourceId: sib.sourceId });
+    }
+  }
+
+  const results = [];
+  for (const { url, sourceId } of urlsToTest.slice(0, 8)) {
+    try {
+      const chapResp = await fetchPOST(`${COMICK_BASE}/chapters`, { url });
+      const chapText = chapResp.buffer.toString('utf8');
+      const objects = parseJsonStream(chapText);
+      const chapterCount = objects.reduce((n, o) => {
+        const list = o.chapters || o.items || o.data || [];
+        return n + (Array.isArray(list) ? list.length : 0);
+      }, 0);
+      results.push({ sourceId, url, rawSample: chapText.slice(0, 150), chapterCount });
+    } catch (e) {
+      results.push({ sourceId, url, erro: e.message, chapterCount: 0 });
+    }
+  }
+
+  return res.json({
+    id, entry, titleKey: key, siblings: siblings.length,
+    testedUrls: urlsToTest.length, results,
+  });
+});
+
 
 // ─── GET /debug?id=... ───────────────────────────────────────────────────────
 app.get('/debug', async (req, res) => {
