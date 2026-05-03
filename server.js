@@ -192,10 +192,35 @@ app.get('/debug', async (req, res) => {
   try {
     const raw = await mpRaw(endpoint);
     const resp = readPB(raw);
-    const topFields = Object.keys(resp).join(',');
     const successBuf = resp[1]?.[0];
-    const successFields = successBuf ? Object.keys(readPB(pb(successBuf))).join(',') : 'none';
-    res.json({ endpoint, size: raw.length, topFields, successFields, hex20: raw.slice(0, 20).toString('hex') });
+    const success = readPB(pb(successBuf));
+    const tdvBuf = success[8]?.[0];
+    const tdv = readPB(pb(tdvBuf));
+
+    // Mostra cada field do titleDetailView com tipo e preview
+    const fieldInfo = {};
+    for (const [fn, vals] of Object.entries(tdv)) {
+      fieldInfo[fn] = vals.map(v => {
+        if (typeof v === 'number') return { type: 'varint', value: v };
+        const str = Buffer.from(v).toString('utf8');
+        const isPrintable = /^[\x20-\x7E\u00C0-\uFFFF]*$/.test(str);
+        if (isPrintable && str.length < 200) return { type: 'string', value: str };
+        // tenta parsear como sub-message
+        try {
+          const sub = readPB(Buffer.from(v));
+          const subInfo = {};
+          for (const [sf, svs] of Object.entries(sub)) {
+            subInfo[sf] = svs.map(sv => {
+              if (typeof sv === 'number') return sv;
+              const ss = Buffer.from(sv).toString('utf8');
+              return /^[\x20-\x7E\u00C0-\uFFFF]*$/.test(ss) ? ss.slice(0,80) : `<bytes ${sv.length}>`;
+            });
+          }
+          return { type: 'message', fields: subInfo };
+        } catch { return { type: 'bytes', length: v.length }; }
+      });
+    }
+    res.json({ endpoint, size: raw.length, titleDetailViewFields: fieldInfo });
   } catch (e) {
     res.json({ error: e.message, endpoint });
   }
