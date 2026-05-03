@@ -242,7 +242,7 @@ app.get('/manga', async (req, res) => {
       const d = await mpGetTitle(id);
       console.log(`[MANGA] MangaPlus: "${d.title}" | ${d.chapters.length} caps`);
       return res.json({ ...d, source: 'mangaplus' });
-    } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); }
+    } catch (e) { console.error('[MANGA] MangaPlus erro:', e.message); return res.json({ error: e.message, source: 'mangaplus_failed' }); }
   }
 
   try {
