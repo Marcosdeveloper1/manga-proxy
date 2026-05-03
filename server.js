@@ -273,24 +273,17 @@ const COMICK_HEADERS = {
 
 async function comickSearch(query) {
   try {
-    const data = await fetchJSON(
-      `${COMICK_BASE}/v1.0/search?q=${encodeURIComponent(query)}&limit=10&page=1`,
-      COMICK_HEADERS
+    const response = await fetchJSON(
+      `https://api.comick.fun/search?q=${encodeURIComponent(query)}&limit=20`
     );
-    if (!Array.isArray(data) || data.length === 0) return [];
-    return data.map(m => {
-      const cover = m.md_covers?.[0];
-      const coverUrl = cover
-        ? `https://meo.comick.pictures/${cover.b2key}`
-        : null;
-      return {
-        id: m.hid || m.slug,
-        title: m.title || m.slug || '',
-        coverUrl,
-        slug: m.slug,
-        source: 'comick',
-      };
-    }).filter(r => r.id && r.title);
+    if (!response || !Array.isArray(response.data)) return [];
+    
+    return response.data.map(item => ({
+      id: item.id,
+      title: item.title,
+      coverUrl: item.poster ? `https://meo.comick.pictures/${item.poster}` : null,
+      source: 'comick'
+    })).filter(r => r.id && r.title);
   } catch (e) {
     console.warn('[COMICK] search erro:', e.message);
     return [];
