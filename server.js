@@ -285,27 +285,33 @@ async function comickSearch(query) {
     );
     
     const text = response.buffer.toString('utf8');
-    console.log(`[COMICK] Status: ${response.status}, Primeiros 200 chars:`, text.slice(0, 200));
     
-    // Se não é JSON válido, falha
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch (parseErr) {
-      console.error('[COMICK] JSON inválido:', parseErr.message);
-      console.error('[COMICK] Conteúdo:', text.slice(0, 500));
-      return [];
+    // Parse de múltiplos JSONs (stream)
+    const results = [];
+    const jsonObjects = text.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+    
+    for (const jsonStr of jsonObjects) {
+      try {
+        const obj = JSON.parse(jsonStr);
+        if (obj.results && Array.isArray(obj.results)) {
+          results.push(...obj.results.map(item => ({
+            id: item.id,
+            title: item.title,
+            coverUrl: item.coverImage,
+            source: 'comick',
+            latestChapter: item.latestChapter
+          })));
+        }
+      } catch (e) {
+        // Ignora JSONs inválidos
+      }
     }
     
-    return (data.results || []).map(item => ({
-      id: item.id,
-      title: item.title,
-      coverUrl: item.coverImage,
-      source: 'comick'
-    })).filter(r => r.id && r.title);
+    console.log(`[COMICK] ${results.length} resultados encontrados`);
+    return results.slice(0, 20); // Limita a 20
     
   } catch (e) {
-    console.error('[COMICK] erro total:', e.message);
+    console.error('[COMICK] erro:', e.message);
     return [];
   }
 }
