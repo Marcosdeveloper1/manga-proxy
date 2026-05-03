@@ -1095,7 +1095,11 @@ function deduplicateChapters(rawChapters) {
   for (const ch of rawChapters) {
     const num = ch.attributes.chapter ?? ch.attributes.title ?? ch.id;
     const existing = chapMap.get(num);
-    if (!existing) { chapMap.set(num, ch); continue; }
+    
+    if (!existing) {
+      chapMap.set(num, ch);
+      continue;
+    }
 
     const newIsBr = isBrGroup(ch);
     const oldIsBr = isBrGroup(existing);
@@ -1103,89 +1107,98 @@ function deduplicateChapters(rawChapters) {
     const oldPages = existing.attributes.pages || 0;
 
     // Prefere grupo BR; se empate, prefere mais páginas
-    if (newIsBr && !oldIsBr) { chapMap.set(num, ch); }
-    else if (!newIsBr && oldIsBr) { /* mantém existing */ }
-    else if (newPages > oldPages) { chapMap.set(num, ch); }
+    if (newIsBr && !oldIsBr) {
+      chapMap.set(num, ch);
+    } else if (!newIsBr && oldIsBr) {
+      // mantém existing
+    } else if (newPages >= oldPages) {
+      // Se ambos são BR ou ambos não são, pega o que tem mais páginas (ou o mais recente)
+      chapMap.set(num, ch);
+    }
   }
+
+  // Ordena por número de capítulo decrescente
   return [...chapMap.values()].sort((a, b) => {
     const na = parseFloat(a.attributes.chapter) || 0;
     const nb = parseFloat(b.attributes.chapter) || 0;
-    return nb - na; // mais recente primeiro
+    if (nb !== na) return nb - na;
+    return 0;
   });
 }
 
 async function mdxGetManga(mangaId) {
-  // Metadados
-  const m = (await fetchJSON(
-    `https://api.mangadex.org/manga/${mangaId}?includes[]=cover_art&includes[]=author`,
-    { 'User-Agent': 'MangaHook/1.0 (educational)' }
-  )).data;
+  try {
+    // 1. Metadados do Mangá
+    const m = (await fetchJSON(
+      `https://api.mangadex.org/manga/${mangaId}?includes[]=cover_art&includes[]=author`,
+      { 'User-Agent': 'MangaHook/1.0 (educational)' }
+    )).data;
 
-  const title = m.attributes.title['pt-br'] || m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
-  const cover = m.relationships.find(r => r.type === 'cover_art');
-  const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
-  const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
-  const author = m.relationships.find(r => r.type === 'author');
+    if (!m) throw new Error('Mangá não encontrado no MangaDex');
 
-  // Verifica idiomas disponíveis primeiro (evita requests inúteis)
-  const availLangs = m.attributes.availableTranslatedLanguages || [];
-  console.log(`[MDX] "${title}" | langs disponíveis: [${availLangs.join(', ')}]`);
+    const title = m.attributes.title['pt-br'] || m.attributes.title.en || Object.values(m.attributes.title)[0] || '';
+    const cover = m.relationships.find(r => r.type === 'cover_art');
+    const coverUrl = cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null;
+    const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
+    const author = m.relationships.find(r => r.type === 'author');
 
-  // Estratégia: PT-BR → PT → EN — NUNCA mistura idiomas
-  let rawChapters = [];
-  let usedLang = null;
+    // 2. Busca capítulos por idioma prioritário
+    const availLangs = m.attributes.availableTranslatedLanguages || [];
+    console.log(`[MDX] "${title}" | langs disponíveis: [${availLangs.join(', ')}]`);
 
-  const langsToTry = ['pt-br', 'pt', 'en'].filter(l =>
-    availLangs.length === 0 || availLangs.includes(l)
-  );
-  // Se nenhum dos preferidos está disponível, tenta EN de qualquer jeito como último recurso
-  if (!langsToTry.includes('en')) langsToTry.push('en');
+    let rawChapters = [];
+    let usedLang = null;
 
-  for (const lang of langsToTry) {
-    try {
-      const data = await mdxFetchChaptersForLang(mangaId, lang);
-      if (data.length > 0) {
-        rawChapters = data;
-        usedLang = lang;
-        console.log(`[MDX] ${data.length} caps raw em "${lang}"`);
-        break;
+    // Ordem de preferência: pt-br -> pt -> en
+    const priorityLangs = ['pt-br', 'pt', 'en'];
+    
+    for (const lang of priorityLangs) {
+      try {
+        const data = await mdxFetchChaptersForLang(mangaId, lang);
+        if (data.length > 0) {
+          rawChapters = data;
+          usedLang = lang;
+          console.log(`[MDX] Encontrados ${data.length} capítulos em "${lang}"`);
+          break;
+        }
+      } catch (e) {
+        console.warn(`[MDX] Erro ao buscar lang="${lang}":`, e.message);
       }
-    } catch (e) {
-      console.warn(`[MDX] erro lang="${lang}":`, e.message);
     }
-  }
 
-  const sorted = deduplicateChapters(rawChapters);
+    // 3. Deduplicação e Formatação
+    const sorted = deduplicateChapters(rawChapters);
+    const chapters = sorted.map(ch => {
+      const groups = (ch.relationships || [])
+        .filter(r => r.type === 'scanlation_group')
+        .map(r => r.attributes?.name || r.id)
+        .filter(Boolean);
+      return {
+        id: ch.id,
+        title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
+        chapterNumber: ch.attributes.chapter || '0',
+        volume: ch.attributes.volume || null,
+        lang: usedLang,
+        groups,
+        source: 'mangadex'
+      };
+    });
 
-  const chapters = sorted.map(ch => {
-    const groups = (ch.relationships || [])
-      .filter(r => r.type === 'scanlation_group')
-      .map(r => r.attributes?.name || r.id)
-      .filter(Boolean);
     return {
-      id: ch.id,
-      title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
-      chapterNumber: ch.attributes.chapter || '0',
-      volume: ch.attributes.volume || null,
-      lang: usedLang,
-      groups,
+      title,
+      coverUrl,
+      description: desc,
+      author: author?.attributes?.name || '',
+      status: m.attributes.status || '',
+      year: m.attributes.year || null,
+      availableLangs: availLangs,
+      chapters,
       source: 'mangadex'
     };
-  });
-
-  console.log(`[MDX] "${title}" | ${chapters.length} caps únicos em "${usedLang || 'nenhum'}"`);
-
-  return {
-    title,
-    coverUrl,
-    description: desc,
-    author: author?.attributes?.name || '',
-    status: m.attributes.status || '',
-    year: m.attributes.year || null,
-    availableLangs: availLangs,
-    chapters,
-    source: 'mangadex'
-  };
+  } catch (e) {
+    console.error('[MDX] mdxGetManga erro:', e.message);
+    throw e;
+  }
 }
 
 async function mdxGetPages(chapterId) {
@@ -1655,3 +1668,4 @@ app.get('/cache-clear', (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Proxy v14.0 na porta ${PORT}`));
+ 
