@@ -1,7 +1,7 @@
 {
   "name": "manga-proxy",
-  "version": "3.0.0",
-  "description": "Proxy MangaPlus + MangaDex para app Flutter",
+  "version": "4.0.0",
+  "description": "Proxy MangaPlus + MangaDex — sem Puppeteer",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
