@@ -202,6 +202,54 @@ function xorDecrypt(buf, hexKey) {
 
 app.get('/', (req, res) => res.json({ status: 'ok', version: '6.1-ptbr' }));
 
+// ─── DEBUG2 — estrutura do manga_viewer ──────────────────────────────────────────
+app.get('/debug2', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const chapterId = req.query.id || '7000036';
+  try {
+    // Testa vários endpoints de viewer
+    const endpoints = [
+      `/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`,
+      `/manga_viewer?chapter_id=${chapterId}&split=no&img_quality=super_high`,
+      `/manga_viewer_v2?chapter_id=${chapterId}&split=yes&img_quality=super_high`,
+    ];
+    const results = {};
+    for (const ep of endpoints) {
+      try {
+        const raw = await mpRaw(ep);
+        const resp = readPB(raw);
+        const successBuf = resp[1]?.[0];
+        const success = successBuf ? readPB(pb(successBuf)) : {};
+        results[ep] = {
+          size: raw.length,
+          topFields: Object.keys(resp).join(','),
+          successFields: Object.keys(success).join(','),
+          hex30: raw.slice(0, 30).toString('hex'),
+        };
+        // Se tiver field 10 (mangaViewer), vai fundo
+        if (success[10]?.[0]) {
+          const viewer = readPB(pb(success[10][0]));
+          results[ep].viewerFields = Object.keys(viewer).join(',');
+          results[ep].pageCount = (viewer[1] || []).length;
+          // Mostra o primeiro page
+          if (viewer[1]?.[0]) {
+            const page = readPB(pb(viewer[1][0]));
+            results[ep].firstPageFields = Object.keys(page).join(',');
+            if (page[1]?.[0]) {
+              const mp = readPB(pb(page[1][0]));
+              results[ep].firstMangaPageFields = Object.keys(mp).join(',');
+              if (mp[1]?.[0]) results[ep].firstImageUrl = s(mp[1][0]).slice(0, 80);
+            }
+          }
+        }
+      } catch(e) {
+        results[ep] = { error: e.message };
+      }
+    }
+    res.json(results);
+  } catch (e) { res.json({ error: e.message }); }
+});
+
 // ─── DEBUG — mostra a estrutura real da resposta ───────────────────────────────
 app.get('/debug', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
