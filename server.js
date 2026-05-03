@@ -113,7 +113,7 @@ function decodePage(b) {
   const f = readPB(pb(b));
   return {
     imageUrl: f[1]?.[0] ? s(f[1][0]) : '',
-    encryptionKey: f[4]?.[0] ? s(f[4][0]) : '',
+    encryptionKey: f[5]?.[0] ? s(f[5][0]) : '',  // field 5 confirmado pelo debug
   };
 }
 
@@ -127,7 +127,7 @@ function getSuccess(raw) {
 
 async function mpSearch(query) {
   // allV3 é o endpoint atual (allV2 foi deprecado)
-  const raw = await mpRaw('/title_list/allV3');
+  const raw = await mpRaw('/title_list/allV3?language=0');
   const success = getSuccess(raw);
   // allTitlesView = field 4 dentro do success
   const atv = success[4]?.[0];
@@ -141,7 +141,7 @@ async function mpSearch(query) {
 }
 
 async function mpGetTitle(titleId) {
-  const raw = await mpRaw(`/title_detail_v3?title_id=${titleId}`);
+  const raw = await mpRaw(`/title_detail_v3?title_id=${titleId}&language=0`);
   const success = getSuccess(raw);
   const tdv = success[8]?.[0];
   if (!tdv) throw new Error('titleDetailView(8) nao encontrado. Fields: ' + Object.keys(success).join(','));
@@ -200,7 +200,7 @@ function xorDecrypt(buf, hexKey) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '6.1-ptbr' }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '6.2-fixed' }));
 
 // ─── DEBUG2 — estrutura do manga_viewer ──────────────────────────────────────────
 app.get('/debug2', async (req, res) => {
@@ -398,4 +398,4 @@ app.get('/image-proxy', async (req, res) => {
   } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
-app.listen(PORT, () => console.log(`Manga Proxy v6.1 (PT-BR + allV3) na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Manga Proxy v6.2 (encKey field5 + lang EN) na porta ${PORT}`));
