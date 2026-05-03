@@ -316,33 +316,35 @@ async function comickSearch(query) {
   }
 }
 
-async function comickGetManga(mangaId) {
+async function comickGetManga(mangaIdOrUrl) {
   try {
-    console.log(`[COMICK] getManga: "${mangaId}"`);
+    console.log(`[COMICK] getManga: "${mangaIdOrUrl}"`);
     
-    // Busca o manga pra pegar a URL
-    const searchResp = await fetchPOST(
-      `${COMICK_BASE}/search`,
-      { query: mangaId, source: "all" }
-    );
-    const searchText = searchResp.buffer.toString('utf8');
+    let mangaUrl = mangaIdOrUrl;
     
-    // Extrai URL do primeiro resultado
-    const searchObjects = searchText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
-    let mangaUrl = null;
-    for (const jsonStr of searchObjects) {
-      try {
-        const obj = JSON.parse(jsonStr);
-        if (obj.results && obj.results[0] && obj.results[0].title.toLowerCase().includes(mangaId.toLowerCase())) {
-          mangaUrl = obj.results[0].url;
-          break;
-        }
-      } catch {}
+    // Se não parece URL, faz busca
+    if (!mangaIdOrUrl.includes('http')) {
+      const searchResp = await fetchPOST(
+        `${COMICK_BASE}/search`,
+        { query: mangaIdOrUrl, source: "all" }
+      );
+      const searchText = searchResp.buffer.toString('utf8');
+      const searchObjects = searchText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+      
+      for (const jsonStr of searchObjects) {
+        try {
+          const obj = JSON.parse(jsonStr);
+          if (obj.results && obj.results[0]) {
+            mangaUrl = obj.results[0].url;
+            console.log(`[COMICK] URL encontrada: ${mangaUrl}`);
+            break;
+          }
+        } catch {}
+      }
     }
     
-    if (!mangaUrl) {
-      console.log('[COMICK] URL não encontrada');
-      return { title: mangaId, chapters: [], source: 'comick' };
+    if (!mangaUrl || !mangaUrl.startsWith('http')) {
+      return { title: mangaIdOrUrl, chapters: [], source: 'comick' };
     }
     
     console.log(`[COMICK] URL encontrada: ${mangaUrl}`);
