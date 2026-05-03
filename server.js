@@ -316,41 +316,53 @@ async function comickGetPages(chapterHid) {
   try {
     console.log(`[COMICK] getPages: "${chapterHid.substring(0, 50)}..."`);
     
-    // 1. SEMPRE decodifica base64 → URL real
+    // Decodifica base64
     let chapterUrl;
     try {
       chapterUrl = Buffer.from(chapterHid, 'base64').toString('utf8');
       console.log(`[COMICK] URL: ${chapterUrl}`);
     } catch {
-      chapterUrl = chapterHid; // fallback
+      chapterUrl = chapterHid;
     }
     
-    // 2. Usa endpoint CORRETO: /pages
+    // Chama API
     const pagesResp = await fetchPOST(
       `${COMICK_BASE}/pages`,
-      { url: chapterUrl },
-      { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      { url: chapterUrl }
     );
     
-    // 3. Parse do STREAM (igual search/manga)
     const pagesText = pagesResp.buffer.toString('utf8');
+    console.log(`[COMICK] Response (primeiros 500): ${pagesText.substring(0, 500)}...`);
+    
+    // Parse stream
     const pagesObjects = pagesText.match(/\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}/g) || [];
+    console.log(`[COMICK] ${pagesObjects.length} objetos JSON encontrados`);
     
     let pages = [];
-    for (const jsonStr of pagesObjects) {
+    for (let i = 0; i < pagesObjects.length; i++) {
       try {
-        const obj = JSON.parse(jsonStr);
-        if (obj.pages && Array.isArray(obj.pages)) {
-          pages = obj.pages.map(p => p.url || p.src).filter(Boolean);
-          console.log(`[COMICK] ${pages.length} páginas OK`);
+        const obj = JSON.parse(pagesObjects[i]);
+        console.log(`[COMICK] Objeto ${i}:`, Object.keys(obj));
+        
+        // Tenta diferentes campos possíveis
+        if (obj.pages) pages = obj.pages.map(p => p.url || p.src || p).filter(Boolean);
+        else if (obj.images) pages = obj.images.map(p => p.url || p.src || p).filter(Boolean);
+        else if (obj.data && obj.data.images) pages = obj.data.images.map(p => p.url || p).filter(Boolean);
+        else if (Array.isArray(obj)) pages = obj.map(p => p.url || p.src || p).filter(Boolean);
+        
+        if (pages.length > 0) {
+          console.log(`[COMICK] ${pages.length} páginas encontradas!`);
           break;
         }
-      } catch {}
+      } catch (e) {
+        console.log(`[COMICK] Objeto ${i} erro:`, e.message);
+      }
     }
     
+    console.log(`[COMICK] Total páginas finais: ${pages.length}`);
     return pages;
   } catch (e) {
-    console.error('[COMICK] getPages erro:', e.message);
+    console.error('[COMICK] getPages TOTAL erro:', e.message);
     return [];
   }
 }
