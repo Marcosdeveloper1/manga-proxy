@@ -421,46 +421,57 @@ async function comickGetManga(mangaId, providedUrl) {
 
 async function comickGetPages(chapterHid) {
   try {
-    // chapterHid = base64 da URL do capítulo
     const chapterUrl = Buffer.from(chapterHid, 'base64').toString('utf8');
-    if (!chapterUrl.startsWith('http')) {
-      console.warn(`[COMICK] ID não é base64 válido: ${chapterHid}`);
-      return [];
-    }
-    console.log(`[COMICK] Lendo capítulo: ${chapterUrl}`);
+    if (!chapterUrl.startsWith('http')) return [];
+    console.log(`[COMICK] Lendo: ${chapterUrl}`);
 
     const { buffer, status } = await fetchRaw(chapterUrl, {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': 'text/html,*/*',
     });
-
-    if (status !== 200) {
-      console.warn(`[COMICK] HTTP ${status} para ${chapterUrl}`);
-      return [];
-    }
+    if (status !== 200) { console.warn(`[COMICK] HTTP ${status}`); return []; }
 
     const html = buffer.toString('utf8');
     const seen = new Set();
     const pages = [];
 
-    // Padrão 1: JSON embutido no script com arrays de imagens
-    const scriptMatches = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
-    for (const script of scriptMatches) {
-      const imgArrays = script.match(/"(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?)"/g) || [];
-      for (const m of imgArrays) {
-        const url = m.slice(1, -1);
+    // Padrão 1: Next.js __NEXT_DATA__ (AsuraScans e similares)
+    const nextMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextMatch) {
+      try {
+        const nextData = JSON.parse(nextMatch[1]);
+        const str = JSON.stringify(nextData);
+        const urls = str.match(/https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)(?:\?[^"]*)?/gi) || [];
+        for (const url of urls) {
+          if (!seen.has(url) && !url.includes('thumb') && !url.includes('avatar') && !url.includes('logo') && url.length > 40) {
+            seen.add(url);
+            pages.push(url);
+          }
+        }
+        if (pages.length > 0) {
+          console.log(`[COMICK] ${pages.length} páginas via __NEXT_DATA__`);
+          return pages.slice(0, 120);
+        }
+      } catch (_) {}
+    }
+
+    // Padrão 2: JSON em qualquer <script> (outros sites)
+    const scripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || [];
+    for (const script of scripts) {
+      const urls = script.match(/https:\/\/[^"']+\.(?:jpg|jpeg|png|webp)(?:\?[^"']*)?/gi) || [];
+      for (const url of urls) {
         if (!seen.has(url) && !url.includes('thumb') && !url.includes('avatar') && !url.includes('logo') && url.length > 40) {
           seen.add(url);
           pages.push(url);
         }
       }
-      if (pages.length > 5) break; // Achou imagens suficientes no script
+      if (pages.length > 5) break;
     }
 
-    // Padrão 2: tags <img> com src ou data-src (fallback)
+    // Padrão 3: <img src> / <img data-src> (fallback)
     if (pages.length < 3) {
-      const imgMatches = html.match(/(?:src|data-src)="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi) || [];
-      for (const m of imgMatches) {
+      const imgs = html.match(/(?:src|data-src)="(https:\/\/[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi) || [];
+      for (const m of imgs) {
         const url = m.replace(/(?:src|data-src)="|"$/gi, '');
         if (!seen.has(url) && !url.includes('thumb') && !url.includes('avatar') && !url.includes('logo') && url.length > 40) {
           seen.add(url);
@@ -469,7 +480,7 @@ async function comickGetPages(chapterHid) {
       }
     }
 
-    console.log(`[COMICK] ${pages.length} páginas extraídas de ${chapterUrl}`);
+    console.log(`[COMICK] ${pages.length} páginas extraídas`);
     return pages.slice(0, 120);
   } catch (e) {
     console.error('[COMICK] getPages erro:', e.message);
