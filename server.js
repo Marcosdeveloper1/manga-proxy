@@ -141,22 +141,40 @@ async function mpSearch(query) {
 }
 
 async function mpGetTitle(titleId) {
-  // title_detail_v3 é o endpoint atual
   const raw = await mpRaw(`/title_detail_v3?title_id=${titleId}`);
   const success = getSuccess(raw);
-  // titleDetailView = field 8
   const tdv = success[8]?.[0];
-  if (!tdv) throw new Error('titleDetailView(8) não encontrado. Fields: ' + Object.keys(success).join(','));
+  if (!tdv) throw new Error('titleDetailView(8) nao encontrado. Fields: ' + Object.keys(success).join(','));
   const detail = readPB(pb(tdv));
+
+  // field 1 = Title object
   const titleInfo = detail[1]?.[0] ? decodeTitle(detail[1][0]) : {};
-  const overview = detail[2]?.[0] ? s(detail[2][0]) : '';
-  const firstChaps = (detail[6] || []).map(decodeChapter);
-  const lastChaps = (detail[7] || []).map(decodeChapter);
+
+  // field 28 = chapterListGroup[] { name(1), firstChapterList(2)[], lastChapterList(4)[] }
+  const chapters = [];
   const seen = new Set();
-  const chapters = [...firstChaps, ...lastChaps]
-    .filter(c => c.chapterId && !seen.has(c.chapterId) && seen.add(c.chapterId))
-    .map(c => ({ id: String(c.chapterId), title: c.subTitle || `Capítulo ${c.name}`, chapterNumber: c.name || String(c.chapterId), source: 'mangaplus' }));
-  return { title: titleInfo.name || '', coverUrl: titleInfo.portraitImageUrl || null, description: overview, chapters };
+  for (const groupBuf of (detail[28] || [])) {
+    const group = readPB(pb(groupBuf));
+    const firsts = (group[2] || []).map(decodeChapter);
+    const lasts  = (group[4] || []).map(decodeChapter);
+    for (const c of [...firsts, ...lasts]) {
+      if (!c.chapterId || seen.has(c.chapterId)) continue;
+      seen.add(c.chapterId);
+      chapters.push({
+        id: String(c.chapterId),
+        title: c.subTitle || `Capitulo ${c.name}`,
+        chapterNumber: c.name || String(c.chapterId),
+        source: 'mangaplus',
+      });
+    }
+  }
+
+  return {
+    title: titleInfo.name || '',
+    coverUrl: titleInfo.portraitImageUrl || null,
+    description: titleInfo.author || '',
+    chapters,
+  };
 }
 
 async function mpGetPages(chapterId) {
