@@ -194,6 +194,7 @@ const MANGA_IDS = {
   'tokyo ghoul':             100095,
   'soul eater':              100042,
   'bakuman':                 100020,
+  'black clover':             100003,
   'world trigger':           100079,
   'boruto naruto next generations': 100006,  // ✅ verificado: mangaplus.shueisha.co.jp/titles/100006
   // ── Adicione novos abaixo ─────────────────────────────────────────────────
