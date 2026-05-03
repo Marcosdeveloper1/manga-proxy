@@ -1,7 +1,6 @@
 const express = require('express');
 const https = require('https');
 const http = require('http');
-const path = require('path');
 const protobuf = require('protobufjs');
 
 const app = express();
@@ -12,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 function fetchRaw(url, headers = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-    lib.get(url, { headers: { 'User-Agent': 'Mozilla/5.0', ...headers } }, (res) => {
+    lib.get(url, { headers: { 'User-Agent': 'okhttp/4.9.0', ...headers } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         return fetchRaw(res.headers.location, headers).then(resolve).catch(reject);
       }
@@ -39,37 +38,123 @@ app.use((req, res, next) => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  MANGAPLUS — Protobuf com schema real
+//  MANGAPLUS — Protobuf sem schema (Reader direto do protobufjs)
+//
+//  A API retorna: Response { success(1): SuccessResult }
+//  SuccessResult tem vários oneofs. Lemos campo a campo sem schema.
+//  Referência de field numbers vinda do mloader + hakuneko:
+//    Response.success            = field 1 (message)
+//    SuccessResult.allTitlesView = field 4 (message)
+//    SuccessResult.titleDetail   = field 8 (message)
+//    SuccessResult.mangaViewer   = field 10 (message)
+//    AllTitlesView.titles        = field 1 (repeated message)
+//    Title.titleId               = field 1 (uint32)
+//    Title.name                  = field 2 (string)
+//    Title.author                = field 3 (string)
+//    Title.portraitImageUrl      = field 4 (string)
+//    TitleDetail.title           = field 1 (message)
+//    TitleDetail.overview        = field 2 (string)
+//    TitleDetail.firstChapterList= field 6 (repeated message)
+//    TitleDetail.lastChapterList = field 7 (repeated message)
+//    Chapter.titleId             = field 1 (uint32)
+//    Chapter.chapterId           = field 2 (uint32)
+//    Chapter.name                = field 3 (string)  ← número do cap
+//    Chapter.subTitle            = field 4 (string)  ← nome do cap
+//    MangaViewer.pages           = field 1 (repeated message)
+//    Page.mangaPage              = field 1 (message, oneof)
+//    MangaPage.imageUrl          = field 1 (string)
+//    MangaPage.width             = field 2 (uint32)
+//    MangaPage.height            = field 3 (uint32)
+//    MangaPage.encryptionKey     = field 4 (string)
 // ══════════════════════════════════════════════════════════════════════════════
 
 const MP_BASE = 'https://jumpg-webapi.tokyo-cdn.com/api';
 const MP_HEADERS = {
-  'User-Agent': 'okhttp/4.9.0',
   'Origin': 'https://mangaplus.shueisha.co.jp',
   'Referer': 'https://mangaplus.shueisha.co.jp/',
 };
 
-let mpProto = null;  // cache do schema carregado
-
-async function getMpProto() {
-  if (mpProto) return mpProto;
-  mpProto = await protobuf.load(path.join(__dirname, 'mangaplus.proto'));
-  return mpProto;
+// Usa o Reader do protobufjs para percorrer o buffer sem schema
+function readFields(buf) {
+  const reader = protobuf.Reader.create(buf);
+  const fields = {};
+  while (reader.pos < reader.len) {
+    const tag = reader.uint32();
+    const fieldNum = tag >>> 3;
+    const wireType = tag & 7;
+    if (!fields[fieldNum]) fields[fieldNum] = [];
+    if (wireType === 0) {
+      fields[fieldNum].push(reader.uint32());
+    } else if (wireType === 2) {
+      fields[fieldNum].push(reader.bytes());
+    } else if (wireType === 1) {
+      reader.skip(8); // fixed64
+    } else if (wireType === 5) {
+      reader.skip(4); // fixed32
+    } else {
+      break; // wire type inválido
+    }
+  }
+  return fields;
 }
 
-async function mpFetch(url) {
-  const root = await getMpProto();
-  const Response = root.lookupType('Response');
-  const { buffer } = await fetchRaw(url, MP_HEADERS);
-  const msg = Response.decode(buffer);
-  return Response.toObject(msg, { longs: String, enums: String, defaults: true });
+function str(bytes) { return Buffer.from(bytes).toString('utf8'); }
+function buf(bytes) { return Buffer.from(bytes); }
+
+async function mpRaw(path) {
+  const { buffer, status } = await fetchRaw(`${MP_BASE}${path}`, MP_HEADERS);
+  if (status !== 200) throw new Error(`HTTP ${status} para ${path}`);
+  return buffer;
+}
+
+// Decodifica Title de um buffer
+function decodeTitle(bytes) {
+  const f = readFields(buf(bytes));
+  return {
+    titleId: f[1]?.[0] || 0,
+    name: f[2]?.[0] ? str(f[2][0]) : '',
+    author: f[3]?.[0] ? str(f[3][0]) : '',
+    portraitImageUrl: f[4]?.[0] ? str(f[4][0]) : '',
+  };
+}
+
+// Decodifica Chapter de um buffer
+function decodeChapter(bytes) {
+  const f = readFields(buf(bytes));
+  return {
+    titleId: f[1]?.[0] || 0,
+    chapterId: f[2]?.[0] || 0,
+    name: f[3]?.[0] ? str(f[3][0]) : '',      // número ex: "1", "1181"
+    subTitle: f[4]?.[0] ? str(f[4][0]) : '',  // nome do capítulo
+  };
+}
+
+// Decodifica MangaPage de um buffer
+function decodeMangaPage(bytes) {
+  const f = readFields(buf(bytes));
+  return {
+    imageUrl: f[1]?.[0] ? str(f[1][0]) : '',
+    encryptionKey: f[4]?.[0] ? str(f[4][0]) : '',
+  };
 }
 
 async function mpSearch(query) {
-  const data = await mpFetch(`${MP_BASE}/title_list/allV2`);
-  const titles = data?.success?.allTitlesView?.titles || [];
+  const raw = await mpRaw('/title_list/allV2');
+  // Response → field 1 (success) → field 4 (allTitlesView) → field 1[] (titles)
+  const resp = readFields(raw);
+  const successBuf = resp[1]?.[0];
+  if (!successBuf) throw new Error('Campo success não encontrado na resposta');
+
+  const success = readFields(buf(successBuf));
+  const allTitlesViewBuf = success[4]?.[0];
+  if (!allTitlesViewBuf) throw new Error('Campo allTitlesView não encontrado');
+
+  const allTitlesView = readFields(buf(allTitlesViewBuf));
+  const titleBufs = allTitlesView[1] || [];
+
   const q = query.toLowerCase();
-  return titles
+  return titleBufs
+    .map(decodeTitle)
     .filter(t => t.name && t.name.toLowerCase().includes(q))
     .slice(0, 20)
     .map(t => ({
@@ -82,46 +167,66 @@ async function mpSearch(query) {
 }
 
 async function mpGetTitle(titleId) {
-  const data = await mpFetch(`${MP_BASE}/title_detail?title_id=${titleId}`);
-  const view = data?.success?.titleDetailView;
-  if (!view) throw new Error('titleDetailView não encontrado');
+  const raw = await mpRaw(`/title_detail?title_id=${titleId}`);
+  // Response → field 1 (success) → field 8 (titleDetailView)
+  const resp = readFields(raw);
+  const successBuf = resp[1]?.[0];
+  if (!successBuf) throw new Error('Campo success não encontrado');
 
-  const t = view.title || {};
-  const rawChaps = [
-    ...(view.firstChapterList || []),
-    ...(view.lastChapterList || []),
-  ];
+  const success = readFields(buf(successBuf));
+  const detailBuf = success[8]?.[0];
+  if (!detailBuf) throw new Error('Campo titleDetailView não encontrado');
+
+  const detail = readFields(buf(detailBuf));
+  const titleInfo = detail[1]?.[0] ? decodeTitle(detail[1][0]) : {};
+  const overview = detail[2]?.[0] ? str(detail[2][0]) : '';
+
+  const firstChaps = (detail[6] || []).map(decodeChapter);
+  const lastChaps = (detail[7] || []).map(decodeChapter);
+
   const seen = new Set();
-  const chapters = rawChaps
-    .filter(c => { if (seen.has(c.chapterId)) return false; seen.add(c.chapterId); return true; })
+  const chapters = [...firstChaps, ...lastChaps]
+    .filter(c => { if (!c.chapterId || seen.has(c.chapterId)) return false; seen.add(c.chapterId); return true; })
     .map(c => ({
       id: String(c.chapterId),
-      title: c.subTitle || c.name || `Capítulo ${c.chapterId}`,
+      title: c.subTitle || `Capítulo ${c.name}`,
       chapterNumber: c.name || String(c.chapterId),
       source: 'mangaplus',
     }));
 
   return {
-    title: t.name || '',
-    coverUrl: t.portraitImageUrl || null,
-    description: view.overview || '',
+    title: titleInfo.name || '',
+    coverUrl: titleInfo.portraitImageUrl || null,
+    description: overview,
     chapters,
   };
 }
 
 async function mpGetPages(chapterId) {
-  const data = await mpFetch(`${MP_BASE}/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`);
-  const viewer = data?.success?.mangaViewer;
-  if (!viewer) throw new Error('mangaViewer não encontrado');
+  const raw = await mpRaw(`/manga_viewer?chapter_id=${chapterId}&split=yes&img_quality=super_high`);
+  // Response → field 1 (success) → field 10 (mangaViewer) → field 1[] (pages) → field 1 (mangaPage)
+  const resp = readFields(raw);
+  const successBuf = resp[1]?.[0];
+  if (!successBuf) throw new Error('Campo success não encontrado');
 
-  return (viewer.pages || [])
-    .filter(p => p.mangaPage?.imageUrl)
-    .map(p => ({
-      imageUrl: p.mangaPage.imageUrl,
-      encryptionKey: p.mangaPage.encryptionKey || null,
-    }));
+  const success = readFields(buf(successBuf));
+  const viewerBuf = success[10]?.[0];
+  if (!viewerBuf) throw new Error('Campo mangaViewer não encontrado');
+
+  const viewer = readFields(buf(viewerBuf));
+  const pageBufs = viewer[1] || [];
+
+  return pageBufs
+    .map(pb => {
+      const page = readFields(buf(pb));
+      const mangaPageBuf = page[1]?.[0];
+      if (!mangaPageBuf) return null;
+      return decodeMangaPage(mangaPageBuf);
+    })
+    .filter(p => p && p.imageUrl);
 }
 
+// Descriptografia XOR do MangaPlus
 function decryptImage(buf, hexKey) {
   const keyBytes = Buffer.from(hexKey, 'hex');
   const result = Buffer.alloc(buf.length);
@@ -136,7 +241,27 @@ function decryptImage(buf, hexKey) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', version: '5.0-protobuf' });
+  res.json({ status: 'ok', version: '5.1-protobuf-reader' });
+});
+
+// ─── DEBUG (deixar por ora para diagnóstico) ───────────────────────────────────
+app.get('/debug', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const titleId = req.query.id || '700005';
+  try {
+    const raw = await mpRaw(`/title_detail?title_id=${titleId}`);
+    const resp = readFields(raw);
+    const successBuf = resp[1]?.[0];
+    const successFields = successBuf ? Object.keys(readFields(buf(successBuf))).join(',') : 'none';
+    res.json({
+      responseSize: raw.length,
+      responseTopFields: Object.keys(resp).join(','),
+      successFields,
+      hex20: raw.slice(0, 20).toString('hex'),
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
 });
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
@@ -152,6 +277,7 @@ app.get('/search', async (req, res) => {
       console.log(`[SEARCH] MangaPlus: ${results.length}`);
       return res.json({ results, source: 'mangaplus' });
     }
+    console.log('[SEARCH] MangaPlus: 0 resultados');
   } catch (e) { console.warn('[SEARCH] MangaPlus erro:', e.message); }
 
   try {
@@ -264,16 +390,10 @@ app.get('/image-proxy', async (req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=86400');
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(result);
-  } catch (e) { res.status(500).send('Erro interno: ' + e.message); }
+  } catch (e) { res.status(500).send('Erro: ' + e.message); }
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, async () => {
-  // Pré-carrega o schema proto na inicialização
-  try {
-    await getMpProto();
-    console.log(`Manga Proxy v5 (Protobuf real) na porta ${PORT}`);
-  } catch (e) {
-    console.error('ERRO ao carregar mangaplus.proto:', e.message);
-  }
+app.listen(PORT, () => {
+  console.log(`Manga Proxy v5.1 (protobuf Reader) na porta ${PORT}`);
 });
