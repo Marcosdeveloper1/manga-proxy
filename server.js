@@ -531,6 +531,28 @@ async function mdxSearch(query) {
   } catch (e) { console.warn('[MDX] search erro:', e.message); return []; }
 }
 
+// Busca todos os capítulos de um idioma específico com paginação automática
+async function mdxFetchChaptersForLang(mangaId, lang) {
+  const allChapters = [];
+  const ratings = 'contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica';
+  const langParam = `&translatedLanguage[]=${lang}`;
+  const limit = 500;
+  let offset = 0;
+  let total = null;
+
+  while (true) {
+    const url = `https://api.mangadex.org/manga/${mangaId}/feed?${langParam}&order[chapter]=asc&limit=${limit}&offset=${offset}&${ratings}`;
+    const cd = await fetchJSON(url, { 'User-Agent': 'MangaHook/1.0 (educational)' });
+    if (!cd.data?.length) break;
+    allChapters.push(...cd.data);
+    if (total === null) total = cd.total || 0;
+    offset += cd.data.length;
+    if (offset >= total || cd.data.length < limit) break;
+  }
+
+  return allChapters;
+}
+
 async function mdxGetManga(mangaId) {
   // Metadados
   const m = (await fetchJSON(
@@ -544,39 +566,54 @@ async function mdxGetManga(mangaId) {
   const desc = m.attributes.description?.['pt-br'] || m.attributes.description?.en || '';
   const author = m.relationships.find(r => r.type === 'author');
 
-  // Capítulos — tenta PT-BR, depois EN, depois qualquer um
-  let chapters = [];
-  for (const lang of ['pt-br', 'en', null]) {
+  // Estratégia de idioma: PT-BR → PT → EN  — NUNCA mistura idiomas
+  // Cada tentativa busca UM idioma limpo. Para quando acha capítulos.
+  let rawChapters = [];
+  let usedLang = null;
+
+  for (const lang of ['pt-br', 'pt', 'en']) {
     try {
-      const langParam = lang ? `&translatedLanguage[]=${lang}` : '';
-      // Pega até 500 capítulos (limite do MDX por request)
-      const cd = await fetchJSON(
-        `https://api.mangadex.org/manga/${mangaId}/feed?${langParam}&order[chapter]=desc&limit=500&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica`,
-        { 'User-Agent': 'MangaHook/1.0 (educational)' }
-      );
-      if (cd.data?.length > 0) {
-        // Deduplica por número de capítulo, preferindo PT-BR
-        const seen = new Set();
-        chapters = cd.data
-          .filter(ch => {
-            const num = ch.attributes.chapter || ch.attributes.title || ch.id;
-            if (seen.has(num)) return false;
-            seen.add(num);
-            return true;
-          })
-          .map(ch => ({
-            id: ch.id,
-            title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
-            chapterNumber: ch.attributes.chapter || '0',
-            volume: ch.attributes.volume || null,
-            lang: ch.attributes.translatedLanguage,
-            source: 'mangadex'
-          }));
-        console.log(`[MDX] ${chapters.length} capítulos em ${lang || 'any'}`);
+      const data = await mdxFetchChaptersForLang(mangaId, lang);
+      if (data.length > 0) {
+        rawChapters = data;
+        usedLang = lang;
+        console.log(`[MDX] ${data.length} capítulos raw em "${lang}"`);
         break;
       }
-    } catch (_) {}
+    } catch (e) {
+      console.warn(`[MDX] erro buscando lang="${lang}":`, e.message);
+    }
   }
+
+  // Deduplica por número de capítulo (mesmo idioma pode ter múltiplos grupos)
+  // Mantém o capítulo com mais pages (qualidade) ou o primeiro se igual
+  const chapMap = new Map();
+  for (const ch of rawChapters) {
+    const num = ch.attributes.chapter ?? ch.attributes.title ?? ch.id;
+    const existing = chapMap.get(num);
+    const pages = ch.attributes.pages || 0;
+    if (!existing || pages > (existing.attributes.pages || 0)) {
+      chapMap.set(num, ch);
+    }
+  }
+
+  // Ordena do maior capítulo para o menor (mais recente primeiro no app)
+  const sorted = [...chapMap.values()].sort((a, b) => {
+    const na = parseFloat(a.attributes.chapter) || 0;
+    const nb = parseFloat(b.attributes.chapter) || 0;
+    return nb - na;
+  });
+
+  const chapters = sorted.map(ch => ({
+    id: ch.id,
+    title: ch.attributes.title || `Capítulo ${ch.attributes.chapter || '?'}`,
+    chapterNumber: ch.attributes.chapter || '0',
+    volume: ch.attributes.volume || null,
+    lang: usedLang,
+    source: 'mangadex'
+  }));
+
+  console.log(`[MDX] "${title}" | ${chapters.length} capítulos únicos em "${usedLang || 'nenhum'}"`);
 
   return {
     title,
@@ -840,7 +877,7 @@ app.get('/manga', async (req, res) => {
     return res.json(d);
   }
 
-  if (isUuid(id) || source === 'mangadex') {
+  if (isUuid(id) || source === 'mangadex' || source === 'mangahook') {
     try {
       const d = await mdxGetManga(id);
       console.log(`[MANGA] MDX: "${d.title}" | ${d.chapters.length} caps`);
@@ -893,7 +930,7 @@ app.get('/chapter', async (req, res) => {
     } catch (e) { console.error('[CHAPTER] Comick erro:', e.message); }
   }
 
-  if (isUuid(id) || source === 'mangadex') {
+  if (isUuid(id) || source === 'mangadex' || source === 'mangahook') {
     try {
       const pages = await mdxGetPages(id);
       if (pages.length > 0) { console.log(`[CHAPTER] MDX: ${pages.length} páginas`); return res.json({ pages, source: 'mangadex' }); }
