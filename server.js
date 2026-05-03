@@ -264,7 +264,7 @@ async function mpSearch(query) {
 //  Docs: https://api.comick.io
 // ══════════════════════════════════════════════════════════════════════════════
 
-const COMICK_BASE = 'https://api.comick.io';
+const COMICK_BASE = 'https://comick-source-api.notaspider.dev';
 const COMICK_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Accept': 'application/json',
@@ -274,11 +274,9 @@ const COMICK_HEADERS = {
 async function comickSearch(query) {
   try {
     const response = await fetchJSON(
-      `https://api.comick.fun/search?q=${encodeURIComponent(query)}&limit=20`
+      `${COMICK_BASE}/search?q=${encodeURIComponent(query)}&limit=20`
     );
-    if (!response || !Array.isArray(response.data)) return [];
-    
-    return response.data.map(item => ({
+    return (response.data || []).map(item => ({
       id: item.id,
       title: item.title,
       coverUrl: item.poster ? `https://meo.comick.pictures/${item.poster}` : null,
@@ -292,7 +290,7 @@ async function comickSearch(query) {
 
 async function comickGetManga(hid) {
   try {
-    const data = await fetchJSON(`${COMICK_BASE}/comic/${hid}`, COMICK_HEADERS);
+    const data = await fetchJSON(`${COMICK_BASE}/comic/${hid}?lang=pt`);
     const comic = data.comic || data;
     const cover = comic.md_covers?.[0];
     const coverUrl = cover ? `https://meo.comick.pictures/${cover.b2key}` : null;
@@ -330,10 +328,7 @@ async function comickGetManga(hid) {
 
 async function comickGetPages(chapterHid) {
   try {
-    const data = await fetchJSON(
-      `${COMICK_BASE}/chapter/${chapterHid}`,
-      COMICK_HEADERS
-    );
+    const data = await fetchJSON(`${COMICK_BASE}/chapter/${chapterHid}`);
     const images = data.chapter?.md_images || data.md_images || [];
     return images.map(img => `https://meo.comick.pictures/${img.b2key}`).filter(Boolean);
   } catch (e) {
