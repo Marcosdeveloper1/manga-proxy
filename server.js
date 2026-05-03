@@ -87,7 +87,8 @@ app.use((req, res, next) => { res.setHeader('Access-Control-Allow-Origin', '*');
 //  Requests subsequentes ao mesmo domínio reutilizam o browser já aberto
 // ══════════════════════════════════════════════════════════════════════════════
 
-const FLARE_URL = (process.env.FLARESOLVERR_URL || 'https://flaresolverr-production-ed33.up.railway.app').replace(/\/$/, '');
+const _rawFlare = process.env.FLARESOLVERR_URL || 'https://flaresolverr-production-ed33.up.railway.app';
+const FLARE_URL = (_rawFlare.startsWith('http') ? _rawFlare : 'https://' + _rawFlare).replace(/\/$/, '');
 const FLARE_TIMEOUT = 60000; // 60s para resolver o desafio
 
 // Sessões ativas por domínio: domain → { sessionId, userAgent, cookies, ts }
