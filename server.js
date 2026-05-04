@@ -1692,16 +1692,33 @@ app.get('/flare-test', async (req, res) => {
   }
   try {
     const start = Date.now();
-    const result = await flareGet(decodeURIComponent(url), false);
-    return res.json({
-      ok: true,
-      status: result.status,
-      htmlLength: result.html.length,
-      ms: Date.now() - start,
-      userAgent: result.userAgent,
-      cookies: result.cookies.length,
-      htmlSample: result.html.slice(0, 500),
-    });
+    // Chama FlareSolverr diretamente para ver a resposta raw em caso de erro
+    const targetUrl = decodeURIComponent(url);
+    const body = { cmd: 'request.get', url: targetUrl, maxTimeout: FLARE_TIMEOUT };
+    const { buffer, status } = await fetchPOST(`${FLARE_URL}/v1`, body, {}, FLARE_TIMEOUT + 5000);
+    const rawJson = JSON.parse(buffer.toString('utf8'));
+    const ms = Date.now() - start;
+    if (rawJson.status === 'ok') {
+      return res.json({
+        ok: true, flareStatus: 'ok', httpStatus: rawJson.solution?.status,
+        htmlLength: rawJson.solution?.response?.length || 0, ms,
+        userAgent: rawJson.solution?.userAgent,
+        cookies: rawJson.solution?.cookies?.length || 0,
+        htmlSample: (rawJson.solution?.response || '').slice(0, 800),
+      });
+    } else {
+      // Mostra a resposta completa do FlareSolverr para diagnóstico
+      return res.json({
+        ok: false, flareHttpStatus: status, ms,
+        flareMessage: rawJson.message,
+        flareStatus: rawJson.status,
+        diagnosis: rawJson.message?.includes('Timeout') 
+          ? 'Cloudflare Turnstile/CAPTCHA — FlareSolverr não consegue resolver este desafio automaticamente. O site usa proteção avançada.'
+          : rawJson.message?.includes('ERR_NAME_NOT_RESOLVED')
+          ? 'DNS não resolvido — verifique a URL'
+          : 'Erro desconhecido do FlareSolverr',
+      });
+    }
   } catch (e) {
     return res.json({ ok: false, error: e.message, flareUrl: FLARE_URL });
   }
@@ -1721,4 +1738,4 @@ app.get('/cache-clear', (req, res) => {
   res.json({ ok: true, cleared: 'all', entries: total });
 });
 
-app.listen(PORT, () => console.log(`Proxy v14.0 na porta ${PORT}`));
+app.listen(PORT, () => console.log(`Proxy v15.0 na porta ${PORT}`));
