@@ -11,27 +11,32 @@ const PORT = process.env.PORT || 3000;
 // ══════════════════════════════════════════════════════════════════════════════
 
 const _cache = new Map();
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutos
 
-function cached(key, fn) {
+const TTL_SHORT  = 10 * 60 * 1000;  // 10 min  — títulos/capítulos
+const TTL_LONG   = 60 * 60 * 1000;  // 60 min  — buscas genéricas (home)
+
+// Termos que a home busca no startup — serão pré-aquecidos
+const HOME_QUERIES = ['romance', 'action', 'horror', 'adventure', 'popular', 'trending', 'seinen', 'shounen'];
+
+function cached(key, fn, ttl = TTL_SHORT) {
   const hit = _cache.get(key);
-  if (hit && Date.now() - hit.ts < CACHE_TTL) {
+  if (hit && Date.now() - hit.ts < hit.ttl) {
     console.log(`[CACHE] HIT ${key}`);
     return Promise.resolve(hit.value);
   }
   return fn().then(v => {
-    _cache.set(key, { value: v, ts: Date.now() });
+    _cache.set(key, { value: v, ts: Date.now(), ttl });
     return v;
   });
 }
 
-// Limpa entradas expiradas a cada 15 minutos pra não vazar memória
+// Limpa entradas expiradas a cada 20 minutos
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of _cache.entries()) {
-    if (now - v.ts > CACHE_TTL) _cache.delete(k);
+    if (now - v.ts > v.ttl) _cache.delete(k);
   }
-}, 15 * 60 * 1000);
+}, 20 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  HTTP HELPERS
@@ -305,11 +310,11 @@ async function mpSearch(query) {
 
 const COMICK_BASE = 'https://comick-source-api.notaspider.dev/api';
 
-async function comickSearch(query) {
+async function comickSearch(query, timeoutMs = 5000) {
   return cached(`ck:search:${query}`, async () => {
     try {
       console.log(`[COMICK] Buscando: "${query}"`);
-      const response = await fetchPOST(`${COMICK_BASE}/search`, { query, source: 'all' });
+      const response = await fetchPOST(`${COMICK_BASE}/search`, { query, source: 'all' }, {}, timeoutMs);
       const objects = parseJsonStream(response.buffer.toString('utf8'));
       const results = [];
       for (const obj of objects) {
@@ -496,7 +501,7 @@ async function anilistGetMeta(anilistId) {
 //  MANGADEX
 // ══════════════════════════════════════════════════════════════════════════════
 
-async function mdxSearch(query) {
+async function mdxSearch(query, ttl = TTL_SHORT) {
   return cached(`mdx:search:${query}`, async () => {
     try {
       const data = await fetchJSON(`https://api.mangadex.org/manga?title=${encodeURIComponent(query)}&limit=20&order[relevance]=desc&includes[]=cover_art&contentRating[]=safe&contentRating[]=suggestive`);
@@ -507,7 +512,7 @@ async function mdxSearch(query) {
         return { id: m.id, title, coverUrl: cover ? `https://uploads.mangadex.org/covers/${m.id}/${cover.attributes?.fileName}.512.jpg` : null, source: 'mangadex' };
       });
     } catch (e) { return []; }
-  });
+  }, ttl);
 }
 
 function xorDecrypt(buf, hexKey) {
@@ -520,10 +525,14 @@ function xorDecrypt(buf, hexKey) {
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => res.json({
-  status: 'ok', version: '13.0-optimized',
+  status: 'ok', version: '13.1-warmcache',
   sources: ['mangaplus', 'comick', 'mangadex', 'anilist'],
   endpoints: ['/', '/search', '/manga', '/chapter', '/image-proxy', '/titles', '/debug', '/meta']
 }));
+
+// Detecta se a query é um termo genérico de home (não é busca real de usuário)
+const HOME_QUERY_SET = new Set(HOME_QUERIES);
+function isHomeQuery(q) { return HOME_QUERY_SET.has(q.toLowerCase().trim()); }
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -532,15 +541,19 @@ app.get('/search', async (req, res) => {
   if (!q) return res.status(400).json({ error: 'q obrigatório' });
   console.log(`[SEARCH] "${q}" source="${source || 'auto'}"`);
 
-  if (source === 'comick')   return res.json({ results: await comickSearch(q),  source: 'comick' });
-  if (source === 'anilist')  return res.json({ results: await anilistSearch(q), source: 'anilist' });
-  if (source === 'mangadex') return res.json({ results: await mdxSearch(q),     source: 'mangadex' });
+  const isHome = isHomeQuery(q);
+  const ttl = isHome ? TTL_LONG : TTL_SHORT;
+
+  if (source === 'comick')   return res.json({ results: await comickSearch(q),           source: 'comick' });
+  if (source === 'anilist')  return res.json({ results: await anilistSearch(q),          source: 'anilist' });
+  if (source === 'mangadex') return res.json({ results: await mdxSearch(q, ttl),         source: 'mangadex' });
 
   // ── AUTO: dispara as 3 fontes em paralelo ─────────────────────────────────
+  // Comick tem timeout curto (3s) pois costuma ser instável
   const [mpRes, ckRes, mdxRes] = await Promise.allSettled([
     mpSearch(q),
-    comickSearch(q),
-    mdxSearch(q),
+    comickSearch(q, 3000),
+    mdxSearch(q, ttl),
   ]);
 
   // Prioridade: MangaPlus → Comick → MangaDex
@@ -715,4 +728,18 @@ app.get('/debug', async (req, res) => {
   } catch (e) { res.json({ ok: false, erro: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`Proxy v13.0-optimized na porta ${PORT}`));
+// ══════════════════════════════════════════════════════════════════════════════
+//  WARM CACHE — pré-aquece os termos da home no startup
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function warmCache() {
+  console.log(`[CACHE] Aquecendo ${HOME_QUERIES.length} queries da home...`);
+  await Promise.allSettled(HOME_QUERIES.map(q => mdxSearch(q, TTL_LONG)));
+  console.log('[CACHE] Aquecimento concluído.');
+}
+
+app.listen(PORT, () => {
+  console.log(`Proxy v13.1-warmcache na porta ${PORT}`);
+  // Aquece o cache 2s após subir pra não bloquear o startup
+  setTimeout(warmCache, 2000);
+});
