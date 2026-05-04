@@ -346,61 +346,102 @@ async function lerGetPages(b64url) {
   } catch (e) { console.error('[LER] getPages erro:', e.message); return []; }
 }
 
-// ── Tatakae Scan ─────────────────────────────────────────────────────────────
-// Site: https://tatakaescan.com — também Madara theme
-
-async function tatakaeSearch(query) {
-  const cached = getCachedSearch('tatakae', query);
-  if (cached) { console.log('[TATAKAE] cache hit'); return cached; }
+// ── Busca genérica via AJAX do Madara (mais confiável que HTML scraping)
+async function madaraAjaxSearch(baseUrl, domain, sourcePrefix, query) {
+  const cached = getCachedSearch(sourcePrefix, query);
+  if (cached) { console.log(`[${sourcePrefix.toUpperCase()}] cache hit`); return cached; }
   try {
-    const { html } = await flareGet(`https://tatakaescan.com/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
-    const results = parseMadaraSearchResults(html, 'tatakaescan.com', 'tatakae');
-    console.log(`[TATAKAE] ${results.length} resultados`);
-    setCachedSearch('tatakae', query, results);
+    const sess = flareSessions[domain];
+    const cookieStr = sess ? sess.cookies.map(c => `${c.name}=${c.value}`).join('; ') : '';
+    const ua = sess?.userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
+    let results = [];
+
+    // 1a tentativa: endpoint AJAX do Madara (retorna JSON)
+    try {
+      const ajaxUrl = `${baseUrl}/wp-admin/admin-ajax.php`;
+      const formBody = `action=madara_ajax_search&query=${encodeURIComponent(query)}`;
+      const ajaxResp = await new Promise((resolve, reject) => {
+        const urlObj = new URL(ajaxUrl);
+        const opts = {
+          hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': Buffer.byteLength(formBody),
+            'User-Agent': ua, 'Cookie': cookieStr,
+            'Referer': baseUrl + '/',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json, text/javascript, */*',
+          }
+        };
+        const req = https.request(opts, (res) => {
+          const chunks = [];
+          res.on('data', ch => chunks.push(ch));
+          res.on('end', () => resolve({ text: Buffer.concat(chunks).toString('utf8'), status: res.statusCode }));
+        });
+        req.on('error', reject);
+        setTimeout(() => { req.destroy(); reject(new Error('Timeout AJAX')); }, 10000);
+        req.write(formBody);
+        req.end();
+      });
+
+      console.log(`[${sourcePrefix.toUpperCase()}] AJAX status=${ajaxResp.status} len=${ajaxResp.text.length}`);
+
+      if (ajaxResp.status === 200 && ajaxResp.text.length > 100) {
+        if (ajaxResp.text.trim().startsWith('[')) {
+          const arr = JSON.parse(ajaxResp.text);
+          for (const item of arr) {
+            if (!item.title) continue;
+            const slug = (item.url || '').replace(/\/$/, '').split('/').pop();
+            results.push({
+              id: `${sourcePrefix}:${slug}`,
+              title: (item.title || '').replace(/<[^>]+>/g, '').trim(),
+              coverUrl: item.thumbnail || item.image || null,
+              url: item.url || null, source: sourcePrefix,
+            });
+          }
+        } else if (ajaxResp.text.includes('<a')) {
+          results = parseMadaraSearchResults(ajaxResp.text, domain, sourcePrefix);
+        }
+      }
+    } catch (e) { console.warn(`[${sourcePrefix.toUpperCase()}] AJAX falhou: ${e.message}`); }
+
+    // 2a tentativa: busca HTML via FlareSolverr (fallback)
+    if (results.length === 0) {
+      console.log(`[${sourcePrefix.toUpperCase()}] Tentando HTML via FlareSolverr...`);
+      const searchUrl = `${baseUrl}/?s=${encodeURIComponent(query)}&post_type=wp-manga`;
+      const { html } = await flareGet(searchUrl);
+      console.log(`[${sourcePrefix.toUpperCase()}] HTML len=${html.length}`);
+      results = parseMadaraSearchResults(html, domain, sourcePrefix);
+
+      // Fallback: extrai qualquer link de manga do HTML
+      if (results.length === 0 && html.length > 500) {
+        const escapedDomain = domain.replace(/\./g, '\\.');
+        const linkRx = new RegExp(`href="(https://${escapedDomain}/manga/[^"]+)"[^>]*>([^<]{3,80})`, 'gi');
+        let lm;
+        const seen = new Set();
+        while ((lm = linkRx.exec(html)) !== null && results.length < 15) {
+          const url = lm[1].split('?')[0];
+          if (seen.has(url)) continue;
+          seen.add(url);
+          const slug = url.replace(/\/$/, '').split('/').pop();
+          results.push({ id: `${sourcePrefix}:${slug}`, title: lm[2].trim(), coverUrl: null, url, source: sourcePrefix });
+        }
+      }
+    }
+
+    console.log(`[${sourcePrefix.toUpperCase()}] ${results.length} resultados`);
+    if (results.length > 0) setCachedSearch(sourcePrefix, query, results);
     return results;
-  } catch (e) { console.error('[TATAKAE] search erro:', e.message); return []; }
+  } catch (e) {
+    console.error(`[${sourcePrefix.toUpperCase()}] search erro:`, e.message);
+    return [];
+  }
 }
 
-// ── Sakura Mangas ─────────────────────────────────────────────────────────────
-// Site: https://sakuramangas.org — Madara theme
-
-async function sakuraSearch(query) {
-  const cached = getCachedSearch('sakura', query);
-  if (cached) { console.log('[SAKURA] cache hit'); return cached; }
-  try {
-    const { html } = await flareGet(`https://sakuramangas.org/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
-    const results = parseMadaraSearchResults(html, 'sakuramangas.org', 'sakura');
-    console.log(`[SAKURA] ${results.length} resultados`);
-    setCachedSearch('sakura', query, results);
-    return results;
-  } catch (e) { console.error('[SAKURA] search erro:', e.message); return []; }
-}
-
-// ── Taiyo.moe ─────────────────────────────────────────────────────────────────
-async function taiyoSearch(query) {
-  const cached = getCachedSearch('taiyo', query);
-  if (cached) { console.log('[TAIYO] cache hit'); return cached; }
-  try {
-    const { html } = await flareGet(`https://taiyo.moe/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
-    const results = parseMadaraSearchResults(html, 'taiyo.moe', 'taiyo');
-    console.log(`[TAIYO] ${results.length} resultados`);
-    setCachedSearch('taiyo', query, results);
-    return results;
-  } catch (e) { console.error('[TAIYO] search erro:', e.message); return []; }
-}
-
-// ── Kakusei Project ────────────────────────────────────────────────────────────
-async function kakuseiSearch(query) {
-  const cached = getCachedSearch('kakusei', query);
-  if (cached) { console.log('[KAKUSEI] cache hit'); return cached; }
-  try {
-    const { html } = await flareGet(`https://kakuseiproject.com/?s=${encodeURIComponent(query)}&post_type=wp-manga`);
-    const results = parseMadaraSearchResults(html, 'kakuseiproject.com', 'kakusei');
-    console.log(`[KAKUSEI] ${results.length} resultados`);
-    setCachedSearch('kakusei', query, results);
-    return results;
-  } catch (e) { console.error('[KAKUSEI] search erro:', e.message); return []; }
-}
+async function tatakaeSearch(query) { return madaraAjaxSearch('https://tatakaescan.com', 'tatakaescan.com', 'tatakae', query); }
+async function sakuraSearch(query) { return madaraAjaxSearch('https://sakuramangas.org', 'sakuramangas.org', 'sakura', query); }
+async function taiyoSearch(query) { return madaraAjaxSearch('https://taiyo.moe', 'taiyo.moe', 'taiyo', query); }
+async function kakuseiSearch(query) { return madaraAjaxSearch('https://kakuseiproject.com', 'kakuseiproject.com', 'kakusei', query); }
 
 // ── Parser genérico Madara WordPress theme ────────────────────────────────────
 // Todos esses sites usam o mesmo tema (WP Manga / Madara)
