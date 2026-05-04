@@ -1765,6 +1765,73 @@ app.get('/flare-test', async (req, res) => {
   }
 });
 
+// ─── GET /debug-br?source=tatakae&q=solo ────────────────────────────────────
+app.get('/debug-br', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  const { source, q } = req.query;
+  if (!source || !q) return res.status(400).json({ error: 'source e q obrigatórios' });
+  const siteMap = {
+    tatakae: { base: 'https://tatakaescan.com', domain: 'tatakaescan.com' },
+    sakura:  { base: 'https://sakuramangas.org', domain: 'sakuramangas.org' },
+    taiyo:   { base: 'https://taiyo.moe', domain: 'taiyo.moe' },
+    kakusei: { base: 'https://kakuseiproject.com', domain: 'kakuseiproject.com' },
+  };
+  const site = siteMap[source];
+  if (!site) return res.status(400).json({ error: 'source inválido', valid: Object.keys(siteMap) });
+  const { base, domain } = site;
+  const sess = flareSessions[domain];
+  const cookieStr = sess ? sess.cookies.map(c => `${c.name}=${c.value}`).join('; ') : '';
+  const ua = sess?.userAgent || 'Mozilla/5.0';
+  const result = { source, domain, hasCookies: !!sess, cookieCount: sess?.cookies?.length || 0 };
+
+  // Testa AJAX
+  try {
+    const ajaxUrl = `${base}/wp-admin/admin-ajax.php`;
+    const formBody = `action=madara_ajax_search&query=${encodeURIComponent(q)}`;
+    const ajaxResp = await new Promise((resolve, reject) => {
+      const urlObj = new URL(ajaxUrl);
+      const opts = {
+        hostname: urlObj.hostname, path: urlObj.pathname, method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Content-Length': Buffer.byteLength(formBody),
+          'User-Agent': ua, 'Cookie': cookieStr,
+          'Referer': base + '/', 'X-Requested-With': 'XMLHttpRequest',
+          'Accept': 'application/json, text/javascript, */*',
+        }
+      };
+      const req = https.request(opts, (r) => {
+        const chunks = [];
+        r.on('data', ch => chunks.push(ch));
+        r.on('end', () => resolve({ text: Buffer.concat(chunks).toString('utf8'), status: r.statusCode }));
+      });
+      req.on('error', reject);
+      setTimeout(() => { req.destroy(); reject(new Error('Timeout')); }, 10000);
+      req.write(formBody);
+      req.end();
+    });
+    result.ajax = { status: ajaxResp.status, len: ajaxResp.text.length, sample: ajaxResp.text.slice(0, 800) };
+  } catch (e) { result.ajax = { error: e.message }; }
+
+  // Testa busca HTML via FlareSolverr
+  try {
+    const searchUrl = `${base}/?s=${encodeURIComponent(q)}&post_type=wp-manga`;
+    const { html } = await flareGet(searchUrl);
+    const postTitleCount = (html.match(/post-title/g) || []).length;
+    const itemThumbCount = (html.match(/item-thumb/g) || []).length;
+    const mangaLinks = (html.match(new RegExp(`href="https://${domain}/manga/[^"]+`, 'gi')) || []).slice(0, 8);
+    const mid = Math.floor(html.length / 2);
+    result.htmlSearch = {
+      htmlLen: html.length, postTitleCount, itemThumbCount, mangaLinks,
+      htmlStart: html.slice(0, 600),
+      htmlMid: html.slice(mid - 400, mid + 400),
+      htmlEnd: html.slice(-400),
+    };
+  } catch (e) { result.htmlSearch = { error: e.message }; }
+
+  return res.json(result);
+});
+
 // ─── GET /cache-clear ────────────────────────────────────────────────────────
 
 app.get('/cache-clear', (req, res) => {
