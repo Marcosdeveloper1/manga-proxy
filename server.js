@@ -97,14 +97,22 @@ async function mpRaw(path) {
 
 function getSuccess(raw) {
   const resp = readPB(raw);
-  const topKeys = Object.keys(resp).join(',');
-  const sb = resp[1]?.[0];
+  // O MangaPlus usa field 1 (success) na maioria dos endpoints
+  // mas allV3 retorna field 2 como wrapper — tentamos ambos
+  const sb = resp[1]?.[0] || resp[2]?.[0];
   if (!sb) {
-    // Log detalhado: tamanho, primeiros bytes, fields encontrados
     const hex = raw.slice(0, 16).toString('hex');
+    const topKeys = Object.keys(resp).join(',');
     throw new Error(`MangaPlus: success não encontrado. size=${raw.length} hex=${hex} topFields=${topKeys}`);
   }
-  return readPB(pb(sb));
+  // Se vier de field 2, pode ter mais um nível de wrapper
+  const inner = readPB(pb(sb));
+  // Se field 4 (allTitlesView) existe aqui, ótimo. Se não, tenta descer mais um nível
+  if (inner[4] || inner[8] || inner[10]) return inner;
+  // Tenta o primeiro campo como wrapper adicional
+  const sb2 = inner[1]?.[0] || inner[2]?.[0];
+  if (sb2) return readPB(pb(sb2));
+  return inner;
 }
 
 function decodeTitle(b) {
@@ -141,7 +149,7 @@ function xorDecrypt(buf, hexKey) {
 
 async function mpSearch(query) {
   return cached(`mp:search:${query}`, async () => {
-    const raw = await mpRaw('/title_list/allV3?language=0');
+    const raw = await mpRaw('/title_list/allV3');
     const success = getSuccess(raw);
     const atv = success[4]?.[0];
     if (!atv) return [];
@@ -249,7 +257,7 @@ async function mdxGetPages(chapterId) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '15.1-debug', sources: ['mangaplus', 'mangadex'] }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '15.2-fix', sources: ['mangaplus', 'mangadex'] }));
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -346,7 +354,7 @@ app.get('/home', async (req, res) => {
   const [mpRes, recentRes, manhwaRes] = await Promise.allSettled([
     // MangaPlus — lista completa filtrada pelos mais conhecidos
     cached('home:mangaplus', async () => {
-      const raw = await mpRaw('/title_list/allV3?language=0');
+      const raw = await mpRaw('/title_list/allV3');
       const success = getSuccess(raw);
       const atv = success[4]?.[0];
       if (!atv) return [];
@@ -394,6 +402,6 @@ async function warmCache() {
 }
 
 app.listen(PORT, () => {
-  console.log(`Proxy v15.1-debug na porta ${PORT}`);
+  console.log(`Proxy v15.2-fix na porta ${PORT}`);
   setTimeout(warmCache, 3000);
 });
