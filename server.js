@@ -147,18 +147,57 @@ function xorDecrypt(buf, hexKey) {
   return Buffer.from(buf.map((b, i) => b ^ key[i % key.length]));
 }
 
+// Catálogo local MangaPlus — títulos Shueisha mais populares
+// IDs confirmados: https://jumpg-webapi.tokyo-cdn.com/api/title_detail_v3?title_id=ID
+// O allV3 está bloqueado para IPs de datacenter, então mantemos um catálogo local
+// que é enriquecido com dados reais do title_detail_v3 sob demanda.
+const MP_CATALOG = [
+  { id:'700005', title:'One Piece',            author:'Eiichiro Oda' },
+  { id:'700007', title:'Naruto',               author:'Masashi Kishimoto' },
+  { id:'700011', title:'Boruto',               author:'Ukyo Kodachi' },
+  { id:'700016', title:'Demon Slayer',         author:'Koyoharu Gotouge' },
+  { id:'700030', title:'Jujutsu Kaisen',       author:'Gege Akutami' },
+  { id:'700054', title:'Chainsaw Man',         author:'Tatsuki Fujimoto' },
+  { id:'700061', title:'Dan Da Dan',           author:'Yukinobu Tatsu' },
+  { id:'700041', title:'My Hero Academia',     author:'Kohei Horikoshi' },
+  { id:'700020', title:'Black Clover',         author:'Yuki Tabata' },
+  { id:'700091', title:'Sakamoto Days',        author:'Yuto Suzuki' },
+  { id:'700094', title:'Kagurabachi',          author:'Takeru Hokazono' },
+  { id:'700096', title:'Astro Royale',         author:'Nori Fujii' },
+  { id:'700012', title:'One Punch Man',        author:'Yusuke Murata' },
+  { id:'700034', title:'Spy x Family',         author:'Tatsuya Endo' },
+  { id:'700058', title:'Blue Box',             author:'Kouji Miura' },
+  { id:'700067', title:'Akane-banashi',        author:'Yuki Suenaga' },
+  { id:'700044', title:'Mashle',               author:'Hajime Komoto' },
+  { id:'700019', title:'Dr. Stone',            author:'Riichiro Inagaki' },
+  { id:'700097', title:'Nue\'s Exorcist',     author:'Kota Kawae' },
+  { id:'700099', title:'Cipher Academy',       author:'Yuji Iwasaki' },
+];
+
+// Busca no catálogo local por nome
+function mpSearchLocal(query) {
+  const q = query.toLowerCase();
+  return MP_CATALOG
+    .filter(t => t.title.toLowerCase().includes(q) || t.author.toLowerCase().includes(q))
+    .map(t => ({ id: t.id, title: t.title, coverUrl: null, source: 'mangaplus' }));
+}
+
+// Enriquece com coverUrl real do MangaPlus (title_detail_v3 funciona mesmo no Railway)
+async function mpEnrichWithCover(results) {
+  return Promise.all(results.map(async r => {
+    try {
+      const detail = await mpGetTitle(r.id);
+      return { ...r, title: detail.title || r.title, coverUrl: detail.coverUrl || r.coverUrl };
+    } catch { return r; }
+  }));
+}
+
 async function mpSearch(query) {
   return cached(`mp:search:${query}`, async () => {
-    const raw = await mpRaw('/title_list/allV3');
-    const success = getSuccess(raw);
-    const atv = success[4]?.[0];
-    if (!atv) return [];
-    const titles = readPB(pb(atv))[1] || [];
-    const q = query.toLowerCase();
-    return titles.map(decodeTitle)
-      .filter(t => t.name?.toLowerCase().includes(q))
-      .slice(0, 20)
-      .map(t => ({ id: String(t.titleId), title: t.name, coverUrl: t.portraitImageUrl || null, source: 'mangaplus' }));
+    const local = mpSearchLocal(query);
+    if (local.length === 0) return [];
+    // Enriquece com capas reais (em paralelo, sem travar se falhar)
+    return mpEnrichWithCover(local);
   }, TTL_LONG);
 }
 
@@ -257,7 +296,7 @@ async function mdxGetPages(chapterId) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '15.2-fix', sources: ['mangaplus', 'mangadex'] }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '15.3-catalog', sources: ['mangaplus', 'mangadex'] }));
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -353,13 +392,9 @@ app.get('/home', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   const [mpRes, recentRes, manhwaRes] = await Promise.allSettled([
     // MangaPlus — lista completa filtrada pelos mais conhecidos
-    cached('home:mangaplus', async () => {
-      const raw = await mpRaw('/title_list/allV3');
-      const success = getSuccess(raw);
-      const atv = success[4]?.[0];
-      if (!atv) return [];
-      return (readPB(pb(atv))[1] || []).slice(0, 30).map(decodeTitle).map(t => ({ id: String(t.titleId), title: t.name, coverUrl: t.portraitImageUrl||null, source: 'mangaplus' }));
-    }, TTL_LONG),
+    cached('home:mangaplus', () =>
+      mpEnrichWithCover(MP_CATALOG.map(t => ({ id: t.id, title: t.title, coverUrl: null, source: 'mangaplus' })))
+    , TTL_LONG),
     // MangaDex — lançamentos recentes PT-BR
     cached('home:recent_ptbr', () => fetchJSON(
       `${MDX}/manga?limit=20&order[latestUploadedChapter]=desc` +
@@ -394,7 +429,6 @@ app.get('/home', async (req, res) => {
 async function warmCache() {
   console.log('[CACHE] Aquecendo...');
   await Promise.allSettled([
-    mpSearch('one piece'),   // força load do allV3 do MangaPlus
     mdxSearch('naruto'),
     mdxSearch('shounen'),
   ]);
@@ -402,6 +436,6 @@ async function warmCache() {
 }
 
 app.listen(PORT, () => {
-  console.log(`Proxy v15.2-fix na porta ${PORT}`);
+  console.log(`Proxy v15.3-catalog na porta ${PORT}`);
   setTimeout(warmCache, 3000);
 });
