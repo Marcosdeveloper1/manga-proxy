@@ -84,15 +84,26 @@ const MP     = 'https://jumpg-webapi.tokyo-cdn.com/api';
 const MP_HDR = { 'Origin': 'https://mangaplus.shueisha.co.jp', 'Referer': 'https://mangaplus.shueisha.co.jp/' };
 
 async function mpRaw(path) {
-  const { buffer, status } = await fetchRaw(`${MP}${path}`, MP_HDR, 12000);
-  if (status !== 200) throw new Error(`MangaPlus HTTP ${status}`);
+  const { buffer, status } = await fetchRaw(`${MP}${path}`, MP_HDR, 20000);
+  if (status !== 200) throw new Error(`MangaPlus HTTP ${status} para ${path}`);
+  // Detecta resposta HTML (erro/bloqueio) em vez de Protobuf
+  const preview = buffer.slice(0, 20).toString('utf8');
+  if (preview.startsWith('<!') || preview.startsWith('<h') || preview.startsWith('{')) {
+    throw new Error(`MangaPlus: resposta inesperada (não-Protobuf): ${preview.slice(0,40)}`);
+  }
+  console.log(`[MP] ${path} → ${buffer.length} bytes, hex4=${buffer.slice(0,4).toString('hex')}`);
   return buffer;
 }
 
 function getSuccess(raw) {
   const resp = readPB(raw);
+  const topKeys = Object.keys(resp).join(',');
   const sb = resp[1]?.[0];
-  if (!sb) throw new Error('MangaPlus: campo success não encontrado');
+  if (!sb) {
+    // Log detalhado: tamanho, primeiros bytes, fields encontrados
+    const hex = raw.slice(0, 16).toString('hex');
+    throw new Error(`MangaPlus: success não encontrado. size=${raw.length} hex=${hex} topFields=${topKeys}`);
+  }
   return readPB(pb(sb));
 }
 
@@ -238,7 +249,7 @@ async function mdxGetPages(chapterId) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '15.0-unified', sources: ['mangaplus', 'mangadex'] }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '15.1-debug', sources: ['mangaplus', 'mangadex'] }));
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
@@ -383,6 +394,6 @@ async function warmCache() {
 }
 
 app.listen(PORT, () => {
-  console.log(`Proxy v15.0-unified na porta ${PORT}`);
+  console.log(`Proxy v15.1-debug na porta ${PORT}`);
   setTimeout(warmCache, 3000);
 });
