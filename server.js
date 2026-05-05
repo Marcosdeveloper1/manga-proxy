@@ -174,11 +174,19 @@ const MP_CATALOG = [
   { id:'700099', title:'Cipher Academy',       author:'Yuji Iwasaki' },
 ];
 
-// Busca no catálogo local por nome
+// Busca no catálogo local por nome (com trim e busca por palavras)
 function mpSearchLocal(query) {
-  const q = query.toLowerCase();
+  const q = query.toLowerCase().trim();
+  if (q.length < 2) return [];
+  // Divide em palavras para busca parcial (ex: "one piece" → ["one","piece"])
+  const words = q.split(/\s+/);
   return MP_CATALOG
-    .filter(t => t.title.toLowerCase().includes(q) || t.author.toLowerCase().includes(q))
+    .filter(t => {
+      const titleLow = t.title.toLowerCase();
+      const authorLow = t.author.toLowerCase();
+      // Match se TODAS as palavras aparecem no título OU autor
+      return words.every(w => titleLow.includes(w) || authorLow.includes(w));
+    })
     .map(t => ({ id: t.id, title: t.title, coverUrl: null, source: 'mangaplus' }));
 }
 
@@ -296,12 +304,12 @@ async function mdxGetPages(chapterId) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════════════════════
 
-app.get('/', (req, res) => res.json({ status: 'ok', version: '15.3-catalog', sources: ['mangaplus', 'mangadex'] }));
+app.get('/', (req, res) => res.json({ status: 'ok', version: '15.4-trim', sources: ['mangaplus', 'mangadex'] }));
 
 // ─── GET /search?q=... ────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
-  const { q } = req.query;
+  const q = (req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'q obrigatório' });
   console.log(`[SEARCH] "${q}"`);
 
@@ -436,6 +444,6 @@ async function warmCache() {
 }
 
 app.listen(PORT, () => {
-  console.log(`Proxy v15.3-catalog na porta ${PORT}`);
+  console.log(`Proxy v15.4-trim na porta ${PORT}`);
   setTimeout(warmCache, 3000);
 });
